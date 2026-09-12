@@ -1,5 +1,7 @@
 # Trading AI Terminal (Rust)
 
+![Project-JRX](https://github.com/crycuros/project-jrx/releases/download/v1.0/Screenshot_3.png)
+
 AI-powered desktop trading terminal for forex/gold on **Deriv Options** (primary),
 with optional OANDA backup and Yahoo FX fallback. Runs real account P/L
 reconciliation directly from the broker statement, mines 15+ years of historical
