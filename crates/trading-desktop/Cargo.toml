@@ -1,0 +1,21 @@
+[package]
+name = "trading-desktop"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+iced = { version = "0.13", features = ["canvas", "tokio", "svg", "image"] }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+log = { workspace = true }
+env_logger = "0.11"
+notify-rust = "4"
+trading-core = { path = "../trading-core" }
+trading-api = { path = "../trading-api" }
+trading-exchange = { path = "../trading-exchange" }
+trading-strategy = { path = "../trading-strategy" }
+trading-risk = { path = "../trading-risk" }
+trading-ai = { path = "../trading-ai" }
+trading-db = { path = "../trading-db" }

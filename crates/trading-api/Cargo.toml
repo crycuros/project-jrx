@@ -1,0 +1,15 @@
+[package]
+name = "trading-api"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+axum = { version = "0.8", features = ["ws", "json"] }
+tokio = { workspace = true }
+tower-http = { version = "0.6", features = ["cors"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+futures-util = "0.3"
+log = { workspace = true }
+anyhow = { workspace = true }
+trading-core = { path = "../trading-core" }

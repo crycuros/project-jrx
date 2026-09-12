@@ -1,0 +1,11 @@
+[package]
+name = "trading-risk"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+chrono = { workspace = true }
+anyhow = { workspace = true }
+log = { workspace = true }
+trading-core = { path = "../trading-core" }
