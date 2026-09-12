@@ -82,22 +82,6 @@ cargo build -p trading-desktop --release
 
 Release profile: opt-level 3, LTO, codegen-units 1, panic=abort, stripped.
 
-## Historical data
-
-The AI memory is seeded from Dukascopy m5 CSV files stored in:
-
-```
-%USERPROFILE%\Downloads\dukascopy-data-downloader\data\
-  EURUSD_m5_20100101_20260101.csv
-  GBPUSD_m5_20100101_20260101.csv
-  USDJPY_m5_20100101_20260101.csv
-  XAUUSD_m5_20100101_20260101.csv
-```
-
-On first launch, the engine parses these files, mines patterns, and writes the
-strategy to `data/historicaldatacopy_strategy.json` (~13 KB). The raw pattern
-cache (`historicaldatacopy_memory.cache.json`) is written on every session.
-
 ## Notes
 
 - `fonts/` — JetBrains Mono TTFs embedded at compile time.
