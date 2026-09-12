@@ -258,7 +258,7 @@ async fn engine_loop(cfg: AppConfig) {
     let mem = ai.memory();
     let loaded_symbols = if mem.is_empty() { 0 } else { mem.total_bars() };
     info!(
-        "historicaldatacopy strategy loaded ({} bars, {} patterns) -> see data/historicaldatacopy_strategy.json",
+        "market memory strategy loaded ({} bars, {} patterns) -> see data/market_memory_strategy.json",
         loaded_symbols,
         mem.total_patterns()
     );

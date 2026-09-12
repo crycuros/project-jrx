@@ -3,6 +3,7 @@
 /data/*.db
 /data/*.db-shm
 /data/*.db-wal
-/data/*.cache.json
+/data/*_cache.json
+/data/market_memory_cache.json
 /dist
 *.log

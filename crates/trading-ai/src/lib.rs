@@ -38,12 +38,12 @@ pub struct AiClient {
     client: Client,
     base_url: String,
     model: String,
-    memory: history::HistoricalDataCopyMemory,
+    memory: history::MarketMemory,
 }
 
 impl AiClient {
     pub fn new(cfg: &Config) -> Self {
-        let memory = history::HistoricalDataCopyMemory::load(cfg);
+        let memory = history::MarketMemory::load(cfg);
         Self {
             client: Client::builder()
                 .timeout(Duration::from_secs(120))
@@ -142,8 +142,8 @@ impl AiClient {
         &self.model
     }
 
-    /// Long-term historical data copy memory (2010→2026) with mined patterns.
-    pub fn memory(&self) -> &history::HistoricalDataCopyMemory {
+    /// Long-term market memory with mined patterns.
+    pub fn memory(&self) -> &history::MarketMemory {
         &self.memory
     }
 }

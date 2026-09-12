@@ -1,5 +1,5 @@
-//! HistoricalDataCopy historical memory — builds 2010→2026 daily bars (from the 5-min
-//! CSV exports), mines persistent trading patterns, and stores the result as a
+//! Long-term market memory + AI strategy — builds daily bars from raw candle
+//! exports, mines persistent trading patterns, and stores the result as a
 //! JSON strategy file that the AI + engine can consume.
 
 use std::collections::HashMap;
@@ -13,7 +13,7 @@ use chrono::Datelike;
 
 use trading_core::{Config, Market};
 
-/// Daily aggregation of the HistoricalDataCopy dump for one symbol.
+/// Daily aggregation of the market dump for one symbol.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DailyBar {
     /// Days since the Unix epoch of the bar's open (00:00 UTC).
@@ -37,7 +37,7 @@ pub struct Pattern {
     pub rule: String,
 }
 
-/// The mined strategy for one symbol — persisted to historicaldatacopy_strategy.json.
+/// The mined strategy for one symbol.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MessageStrategy {
     pub symbol: String,
@@ -57,25 +57,20 @@ pub struct MessageStrategy {
 }
 
 /// Long-term market memory + mined strategy for the AI.
-pub struct HistoricalDataCopyMemory {
+pub struct MarketMemory {
     daily: HashMap<String, Vec<DailyBar>>,
     strategy: HashMap<String, MessageStrategy>,
 }
 
-const FILES: [(&str, &str); 4] = [
-    ("EURUSD", "EURUSD_m5_20100101_20260101.csv"),
-    ("GBPUSD", "GBPUSD_m5_20100101_20260101.csv"),
-    ("USDJPY", "USDJPY_m5_20100101_20260101.csv"),
-    ("XAUUSD", "XAUUSD_m5_20100101_20260101.csv"),
-];
+const SYMBOLS: [&str; 4] = ["EURUSD", "GBPUSD", "USDJPY", "XAUUSD"];
 
-const CACHE: &str = "historicaldatacopy_memory.cache.json";
-const STRAT: &str = "historicaldatacopy_strategy.json";
+const CACHE: &str = "market_memory_cache.json";
+const STRAT: &str = "market_memory_strategy.json";
 
-impl HistoricalDataCopyMemory {
+impl MarketMemory {
     /// Load (or build + cache) the memory and mine/store the strategy.
     pub fn load(cfg: &Config) -> Self {
-        let csv_dir = std::env::var("HISTORICALDATACOPY_DIR").unwrap_or_else(|_| dirs_download_dir());
+        let csv_dir = data_dir();
         let cache = cfg.data_dir.join(CACHE);
         let strat_path = cfg.data_dir.join(STRAT);
 
@@ -85,26 +80,26 @@ impl HistoricalDataCopyMemory {
                 Ok(mut m) => {
                     m.ensure_strategy(&strat_path);
                     info!(
-                        "historicaldatacopy memory: loaded {} symbols / {} bars, strategy {} patterns",
+                        "market memory: loaded {} symbols / {} bars, strategy {} patterns",
                         m.daily.len(),
                         m.total_bars(),
                         m.total_patterns()
                     );
                     return m;
                 }
-                Err(e) => warn!("historicaldatacopy memory cache invalid: {e}"),
+                Err(e) => warn!("market memory cache invalid: {e}"),
             }
         }
         let mut m = match Self::build(Path::new(&csv_dir), Path::new(&cache)) {
             Ok(m) => m,
             Err(e) => {
-                warn!("historicaldatacopy memory build failed ({e}); running without history");
+                warn!("market memory build failed ({e}); running without history");
                 return Self { daily: HashMap::new(), strategy: HashMap::new() };
             }
         };
         m.mine_and_store(&strat_path);
         info!(
-            "historicaldatacopy memory: built {} symbols / {} bars / {} patterns",
+            "market memory: built {} symbols / {} bars / {} patterns",
             m.daily.len(),
             m.total_bars(),
             m.total_patterns()
@@ -135,7 +130,7 @@ impl HistoricalDataCopyMemory {
         }
         if let Ok(bytes) = serde_json::to_vec(&strat) {
             let _ = std::fs::write(path, bytes);
-            info!("historicaldatacopy strategy: wrote {}", path.display());
+            info!("market memory strategy: wrote {}", path.display());
         }
         self.strategy = strat;
     }
@@ -160,23 +155,28 @@ impl HistoricalDataCopyMemory {
 
     fn build(csv_dir: &Path, cache: &Path) -> Result<Self> {
         let mut daily: HashMap<String, Vec<DailyBar>> = HashMap::new();
-        for (sym, file) in FILES {
-            match aggregate_daily(csv_dir.join(file)) {
+        for sym in SYMBOLS {
+            let file = discover_csv(csv_dir, sym);
+            let Some(file) = file else {
+                warn!("market memory: no step data for {sym} in {}", csv_dir.display());
+                continue;
+            };
+            match aggregate_daily(file) {
                 Ok(bars) => {
-                    info!("historicaldatacopy memory: {sym} -> {} daily bars", bars.len());
+                    info!("market memory: {sym} -> {} daily bars", bars.len());
                     daily.insert(sym.to_string(), bars);
                 }
-                Err(e) => warn!("historicaldatacopy memory: skip {sym}: {e}"),
+                Err(e) => warn!("market memory: skip {sym}: {e}"),
             }
         }
         if daily.is_empty() {
-            return Err(anyhow!("no historicaldatacopy files parsed"));
+            return Err(anyhow!("no market data files parsed"));
         }
         if let Some(parent) = cache.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
         let bytes = serde_json::to_vec(&daily)?;
-        std::fs::write(cache, bytes).with_context(|| "write historicaldatacopy cache")?;
+        std::fs::write(cache, bytes).with_context(|| "write market memory cache")?;
         Ok(Self { daily, strategy: HashMap::new() })
     }
 
@@ -203,10 +203,10 @@ impl HistoricalDataCopyMemory {
     /// Compact decision context (memory summary) for the AI prompt.
     pub fn context(&self, symbol: &str) -> String {
         let Some(st) = self.strategy_for(symbol) else {
-            return format!("HISTORY[{symbol}]: no cached historicaldatacopy data");
+            return format!("HISTORY[{symbol}]: no cached market memory");
         };
         let mut out = format!(
-            "HISTORY[{symbol}] historicaldatacopy {}..{} ({} daily bars)\n\
+            "HISTORY[{symbol}] market {}..{} ({} daily bars)\n\
              allTime high={:.4} low={:.4} bullishDays={:.1}% avgDailyRange={:.4}%\n\
              persistence(win streak follow)={:.2}",
             st.span_start, st.span_end, st.bars, st.all_time_high, st.all_time_low,
@@ -434,7 +434,7 @@ fn fmt_day(day: i64) -> String {
         .unwrap_or_default()
 }
 
-/// Aggregate a HistoricalDataCopy 5-min CSV into daily OHLC bars.
+/// Aggregate a 5-min candle dump into daily OHLC bars.
 fn aggregate_daily(path: PathBuf) -> Result<Vec<DailyBar>> {
     let file = std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
     let mut out: Vec<DailyBar> = Vec::new();
@@ -499,10 +499,39 @@ fn map_symbol(symbol: &str) -> String {
     }
 }
 
-/// Best-effort path to the Downloads folder (Windows).
-fn dirs_download_dir() -> String {
+/// Locate the directory containing raw candle dumps. Configured via the
+/// HISTORY_DATA_DIR env var, otherwise best-effort within the user's home.
+fn data_dir() -> String {
+    if let Ok(dir) = std::env::var("HISTORY_DATA_DIR") {
+        return dir;
+    }
     let home = std::env::var("USERPROFILE").unwrap_or_else(|_| ".".to_string());
-    format!("{home}\\Downloads\\dukascopy-data-downloader\\data")
+    // The user is expected to point HISTORY_DATA_DIR at their raw data folder;
+    // for convenience, fall back to a handful of common spots.
+    let candidates = [
+        format!("{home}\\Downloads\\market-data"),
+        format!("{home}\\Downloads"),
+        format!("{home}\\market-data"),
+    ];
+    for c in &candidates {
+        if Path::new(c).exists() {
+            return c.clone();
+        }
+    }
+    candidates[0].clone()
+}
+
+/// Find a CSV/step dump for a symbol by looking for a file whose name starts
+/// with the symbol (e.g. `EURUSD*.csv`), avoiding any fixed source naming.
+fn discover_csv(dir: &Path, symbol: &str) -> Option<PathBuf> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    for e in entries.flatten() {
+        let name = e.file_name().to_string_lossy().to_ascii_lowercase();
+        if name.starts_with(&symbol.to_ascii_lowercase()) && name.ends_with(".csv") {
+            return Some(e.path());
+        }
+    }
+    None
 }
 
 /// market helper used by callers

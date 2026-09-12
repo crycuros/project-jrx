@@ -427,9 +427,6 @@ impl DerivFx {
         if let Some(arr) = r["statement"]["transactions"].as_array() {
             for t in arr {
                 let cid = t["contract_id"].as_u64().unwrap_or(0);
-                if cid == 0 {
-                    continue; // skip non-contract rows (deposits etc.)
-                }
                 out.push(StatementTx {
                     transaction_id: t["transaction_id"].as_u64().unwrap_or(0),
                     action_type: t["action_type"].as_str().unwrap_or_default().to_string(),
