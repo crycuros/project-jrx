@@ -4,8 +4,7 @@
 
 AI-powered desktop trading terminal for forex/gold on **Deriv Options** (primary),
 with optional OANDA backup and Yahoo FX fallback. Runs real account P/L
-reconciliation directly from the broker statement, mines 15+ years of historical
-Dukascopy CSV data to build a persistent AI memory graph, and renders a
+reconciliation directly from the broker statement and renders a
 Bloomberg-style dark UI sized for 1440×900.
 
 ## What it does
@@ -17,14 +16,10 @@ Bloomberg-style dark UI sized for 1440×900.
   account profit, not a paper-trades accumulator. Statement buy/sell rows are
   matched per contract to compute realized P/L; deposit and withdrawal rows are
   excluded from the profit calculation.
-- **AI Memory Graph** — historical Dukascopy m5 CSV data (EURUSD, GBPUSD,
-  USDJPY, XAUUSD from 2010) is parsed on first launch, patterns are mined
-  (SMA/EMA crossovers, support/resistance zones, volatility regimes), and the
-  results are persisted in `data/historicaldatacopy_strategy.json` and an
-  in-memory cache. The graph visualizes three orbital tiers: live Signal nodes
-  (inner ring), Regime nodes (mid ring), and Asset nodes (outer ring). Nodes are
-  interactable — hover to see the node label, AI confidence, and the historical
-  pattern context in a tooltip.
+- **AI Memory Graph** — a three-tier orbital graph of mined market patterns:
+  live Signal nodes (inner ring), Regime nodes (mid ring), and Asset nodes
+  (outer ring). Nodes are interactable — hover to see the node label, AI
+  confidence, and the pattern context in a tooltip.
 - **Strategy engine** — SMA/EMA/RSI/ATR/MACD indicators with weighted scoring,
   filtered by a risk gate (max daily loss, max consecutive losses, max open
   positions, risk per trade).
@@ -33,7 +28,7 @@ Bloomberg-style dark UI sized for 1440×900.
 - **Portfolio & Risk panel** — live balance, equity, NET PROFIT (realized +
   unrealized), win rate, open positions table, and factor weights.
 - **SQLite persistence** — trades, app-state, and equity snapshots survive
-  restarts. Historical data is re-mined from the CSVs if the cache is missing.
+  restarts.
 
 ## Layout
 
@@ -41,7 +36,7 @@ Bloomberg-style dark UI sized for 1440×900.
 crates/
   trading-core     config (.env loader), domain models, AI memory graph models
   trading-exchange DerivFx + OandaClient + YahooFx (async reqwest + websockets)
-  trading-strategy indicators + signal scoring + historical data parser
+  trading-strategy indicators + signal scoring + pattern engine
   trading-risk     risk gate + unit tests
   trading-ai       Ollama client + AI memory (patterns, cache, context)
   trading-db       rusqlite persistence (WAL), app-state snapshots
