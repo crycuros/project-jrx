@@ -21,3 +21,4 @@ trading-strategy = { path = "../trading-strategy" }
 trading-risk = { path = "../trading-risk" }
 trading-ai = { path = "../trading-ai" }
 trading-db = { path = "../trading-db" }
+trading-engine = { path = "../trading-engine" }

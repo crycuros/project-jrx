@@ -10,6 +10,8 @@ members = [
     "crates/trading-api",
     "crates/trading-desktop",
     "crates/trading-backtest",
+    "crates/trading-engine",
+    "crates/trading-bot",
 ]
 
 [workspace.package]

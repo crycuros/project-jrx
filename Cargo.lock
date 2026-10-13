@@ -794,6 +794,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d07550c9036bf2ae0c684c4297d503f838287c83c53686d05370d0e139ae570"
 
 [[package]]
+name = "colored"
+version = "2.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "117725a109d387c937a1533ce01b450cbde6b88abceea8473c4d7a85853cda3c"
+dependencies = [
+ "lazy_static",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
 name = "com"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2153,6 +2163,12 @@ name = "khronos_api"
 version = "3.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e2db585e1d738fc771bf08a151420d3ed193d9d895a36df7f6f8a9456b911ddc"
+
+[[package]]
+name = "lazy_static"
+version = "1.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "20870f649af7073d53e38067b2a84312175d56ea15217e1b15bc83506ec50afb"
 
 [[package]]
 name = "libc"
@@ -4143,6 +4159,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "trading-bot"
+version = "1.0.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "colored",
+ "env_logger",
+ "log",
+ "serde",
+ "serde_json",
+ "tokio",
+ "trading-api",
+ "trading-core",
+ "trading-engine",
+]
+
+[[package]]
 name = "trading-core"
 version = "1.0.0"
 dependencies = [
@@ -4183,10 +4216,30 @@ dependencies = [
  "trading-api",
  "trading-core",
  "trading-db",
+ "trading-engine",
  "trading-exchange",
  "trading-risk",
  "trading-strategy",
  "wgpu",
+]
+
+[[package]]
+name = "trading-engine"
+version = "1.0.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "log",
+ "serde",
+ "serde_json",
+ "tokio",
+ "trading-ai",
+ "trading-api",
+ "trading-core",
+ "trading-db",
+ "trading-exchange",
+ "trading-risk",
+ "trading-strategy",
 ]
 
 [[package]]

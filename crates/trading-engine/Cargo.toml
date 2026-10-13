@@ -1,0 +1,19 @@
+[package]
+name = "trading-engine"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+log = { workspace = true }
+anyhow = { workspace = true }
+trading-core = { path = "../trading-core" }
+trading-exchange = { path = "../trading-exchange" }
+trading-strategy = { path = "../trading-strategy" }
+trading-risk = { path = "../trading-risk" }
+trading-ai = { path = "../trading-ai" }
+trading-db = { path = "../trading-db" }
+trading-api = { path = "../trading-api" }
