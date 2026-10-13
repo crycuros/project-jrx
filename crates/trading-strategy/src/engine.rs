@@ -1,8 +1,19 @@
-//! Strategy engine: combines indicators into trade proposals.
+//! Strategy engine: multi-strategy quantitative pipeline.
+//!
+//! Pipeline:
+//!   1. Ingest candles
+//!   2. Regime classification (Condition gate)
+//!   3. Run regime-appropriate strategy modules (Predict)
+//!   4. Combine signals via voting combiner (Allocate)
+//!   5. Return best proposal(s) for risk evaluation
+//!
+//! Based on the 7-stage quant framework: Ingest→Predict→Condition→Allocate→Constrain→Execute→Evaluate
 
-use trading_core::{Candle, Market, OrderSide, Proposal};
+use trading_core::{Candle, Market, OrderSide, Proposal, Regime};
 
-use crate::indicators::{atr, ema, macd, rsi};
+use crate::indicators::{atr, ema, rsi};
+use crate::regime::RegimeDetector;
+use crate::strategies::{breakout, mean_reversion, multi, trend};
 
 /// Result of the quality gate used before AI evaluation.
 #[derive(Debug, Clone)]
@@ -33,120 +44,75 @@ impl SignalQuality {
 pub struct StrategyEngine;
 
 impl StrategyEngine {
-    /// Analyze a candle series for one asset and produce a proposal if a signal fires.
-    pub fn process(&self, candles: &[Candle], symbol: &str, _market: Market) -> Option<Proposal> {
-        let closes: Vec<f64> = candles.iter().map(|c| c.close).collect();
-        let highs: Vec<f64> = candles.iter().map(|c| c.high).collect();
-        let lows: Vec<f64> = candles.iter().map(|c| c.low).collect();
-
-        if closes.len() < 40 {
-            return None;
-        }
-
-        let n = closes.len();
-        let last = closes[n - 1];
-        let rsi_vals = rsi(&closes, 14);
-        let ema_fast = ema(&closes, 12);
-        let ema_slow = ema(&closes, 26);
-        let (macd_line, macd_signal, macd_hist) = macd(&closes);
-        let atr_vals = atr(&highs, &lows, &closes, 14);
-
-        let r = rsi_vals[n - 1].unwrap_or(50.0);
-        let prev_r = rsi_vals[n - 2].unwrap_or(50.0);
-        let ef = ema_fast[n - 1].unwrap_or(last);
-        let es = ema_slow[n - 1].unwrap_or(last);
-        let _macd_line = macd_line[n - 1].unwrap_or(0.0);
-        let m_hist = macd_hist[n - 1].unwrap_or(0.0);
-        let prev_hist = macd_hist[n - 2].unwrap_or(0.0);
-        let atr_val = atr_vals[n - 1].unwrap_or(last * 0.01);
-        let macd_signal_last = macd_signal[n - 1].unwrap_or(0.0);
-
-        // Regime detection
-        let regime = if ef > es { "bullish_trend" } else { "bearish_trend" };
-
-        // Buy signal
-        if (prev_r < 30.0 && r > 30.0)
-            || (m_hist > 0.0 && prev_hist <= 0.0 && r < 65.0)
-            || (m_hist > 0.0 && macd_signal_last < 0.0)
-        {
-            let entry = last;
-            // Price-based stop: 1.5x ATR below entry
-            let stop = (entry - atr_val * 1.5).max(0.0).min(entry);
-            let target = entry + atr_val * 2.5;
-            let confidence = confidence_score(r, 50.0, true, m_hist);
-            return Some(Proposal {
-                symbol: symbol.to_string(),
-                action: OrderSide::Buy,
-                entry,
-                stop_loss: stop,
-                take_profit: target,
-                risk_reward: if entry - stop > 0.0 { (target - entry) / (entry - stop) } else { 0.0 },
-                confidence,
-                regime: regime.to_string(),
-                reason: format!("MACD/RSI cross + {}", regime),
-            });
-        }
-
-        // Sell signal (crossover)
-        if (prev_r > 70.0 && r < 70.0) || (m_hist < 0.0 && prev_hist >= 0.0 && r > 35.0) {
-            let entry = last;
-            let stop = entry + atr_val * 1.5;
-            let target = entry - atr_val * 2.5;
-            let confidence = confidence_score(r, 50.0, false, m_hist);
-            return Some(Proposal {
-                symbol: symbol.to_string(),
-                action: OrderSide::Sell,
-                entry,
-                stop_loss: stop,
-                take_profit: target,
-                risk_reward: if stop - entry > 0.0 { (entry - target) / (stop - entry) } else { 0.0 },
-                confidence,
-                regime: regime.to_string(),
-                reason: format!("MACD/RSI cross + {}", regime),
-            });
-        }
-
-        // Persistent-strong momentum fallback: fires far more often than pure
-        // crossovers, so the engine actually opens positions in trending markets.
-        if ef > es && m_hist > 0.0 && (45.0..72.0).contains(&r) {
-            let entry = last;
-            let stop = (entry - atr_val * 1.5).max(0.0).min(entry);
-            let target = entry + atr_val * 2.5;
-            let confidence = confidence_score(r, 50.0, true, m_hist);
-            return Some(Proposal {
-                symbol: symbol.to_string(),
-                action: OrderSide::Buy,
-                entry,
-                stop_loss: stop,
-                take_profit: target,
-                risk_reward: if entry - stop > 0.0 { (target - entry) / (entry - stop) } else { 0.0 },
-                confidence,
-                regime: regime.to_string(),
-                reason: format!("trend momentum {} (buy)", regime),
-            });
-        }
-        if ef < es && m_hist < 0.0 && (28.0..55.0).contains(&r) {
-            let entry = last;
-            let stop = entry + atr_val * 1.5;
-            let target = entry - atr_val * 2.5;
-            let confidence = confidence_score(r, 50.0, false, m_hist);
-            return Some(Proposal {
-                symbol: symbol.to_string(),
-                action: OrderSide::Sell,
-                entry,
-                stop_loss: stop,
-                take_profit: target,
-                risk_reward: if stop - entry > 0.0 { (entry - target) / (stop - entry) } else { 0.0 },
-                confidence,
-                regime: regime.to_string(),
-                reason: format!("trend momentum {} (sell)", regime),
-            });
-        }
-
-        None
+    /// Full multi-strategy pipeline:
+    /// classifies regime → runs matching strategies → combines signals.
+    /// Returns the best merged proposal or None.
+    pub fn process(&self, candles: &[Candle], symbol: &str, market: Market) -> Option<Proposal> {
+        let proposals = self.process_multi(candles, symbol, market);
+        proposals.into_iter().next()
     }
 
-    /// Market-aware quality scoring (lightweight port of TradeQualityScorer).
+    /// Run full pipeline and return all combined proposals (sorted by confidence).
+    pub fn process_multi(
+        &self,
+        candles: &[Candle],
+        symbol: &str,
+        market: Market,
+    ) -> Vec<Proposal> {
+        if candles.len() < 40 {
+            return Vec::new();
+        }
+
+        // ── Stage 2: Regime Classification (Condition gate) ─────────────────
+        let (regime, adx_val, atr_pct, regime_reason) =
+            RegimeDetector::classify(candles, market);
+
+        log::debug!(
+            "strategy: {} regime={} ADX={:.1} ATR%={:.2} — {}",
+            symbol, regime.as_str(), adx_val, atr_pct, regime_reason
+        );
+
+        // ── Stage 3: Run regime-appropriate strategies (Predict) ─────────────
+        let mut all_proposals: Vec<Proposal> = Vec::new();
+
+        match regime {
+            Regime::Trending => {
+                all_proposals.extend(trend::analyze(candles, symbol, market));
+            }
+            Regime::Ranging => {
+                all_proposals.extend(mean_reversion::analyze(candles, symbol, market));
+                // Shallow pullbacks to EMA-20 in an established macro trend (EMA50 > EMA200)
+                // often temporarily compress ADX into Ranging; allow 5R shallow reclaim signals:
+                let t = trend::analyze(candles, symbol, market);
+                all_proposals.extend(
+                    t.into_iter()
+                        .filter(|p| p.strategy_source == "trend::ema20_shallow_reclaim_5r"),
+                );
+            }
+            Regime::Breakout => {
+                all_proposals.extend(breakout::analyze(candles, symbol, market));
+                // Also allow trend signals during breakout (momentum is valid)
+                all_proposals.extend(trend::analyze(candles, symbol, market));
+            }
+            Regime::Volatile => {
+                // High volatility: reduce to only the highest-confidence trend signals
+                let t = trend::analyze(candles, symbol, market);
+                all_proposals.extend(t.into_iter().filter(|p| p.confidence >= 0.75));
+            }
+        }
+
+        if all_proposals.is_empty() {
+            return Vec::new();
+        }
+
+        // ── Stage 4: Signal voting + IC-weighted combination (Allocate) ──────
+        let combined = multi::combine(all_proposals);
+
+        // Minimum R:R filter — only pass proposals with RR > 1.5
+        combined.into_iter().filter(|p| p.risk_reward >= 1.5).collect()
+    }
+
+    /// Market-aware quality scoring (Evaluate gate before AI).
     pub fn score_quality(&self, side: OrderSide, candles: &[Candle], symbol: &str, market: Market) -> SignalQuality {
         let closes: Vec<f64> = candles.iter().map(|c| c.close).collect();
         if closes.len() < 30 {
@@ -158,10 +124,10 @@ impl StrategyEngine {
         let mut score: f64 = 50.0;
         let mut reasons = Vec::new();
 
-        // Trend alignment (multi-timeframe proxy: EMA slope)
-        let ema5 = ema(&closes, 5)[n - 1].unwrap_or(closes[n - 1]);
+        // Trend alignment (EMA5 vs EMA20)
+        let ema5  = ema(&closes, 5)[n - 1].unwrap_or(closes[n - 1]);
         let ema20 = ema(&closes, 20)[n - 1].unwrap_or(closes[n - 1]);
-        let trending_up = ema5 > ema20;
+        let trending_up   = ema5 > ema20;
         let trending_down = ema5 < ema20;
 
         match side {
@@ -187,22 +153,33 @@ impl StrategyEngine {
             }
         }
 
+        // Regime awareness bonus: if regime matches strategy direction, reward
+        let (regime, _, _, _) = RegimeDetector::classify(candles, market);
+        match (side, regime) {
+            (OrderSide::Buy,  Regime::Trending | Regime::Breakout) => {
+                score += 10.0;
+                reasons.push("regime match".to_string());
+            }
+            (OrderSide::Sell, Regime::Ranging | Regime::Volatile) => {
+                score += 8.0;
+                reasons.push("regime match".to_string());
+            }
+            _ => {}
+        }
+
         // Volatility sanity (ATR% bounds)
         let last = closes[n - 1];
-        let atr_val = atr(
-            &candles.iter().map(|c| c.high).collect::<Vec<_>>(),
-            &candles.iter().map(|c| c.low).collect::<Vec<_>>(),
-            &closes,
-            14,
-        )[n - 1].unwrap_or(0.0);
+        let highs: Vec<f64> = candles.iter().map(|c| c.high).collect();
+        let lows:  Vec<f64> = candles.iter().map(|c| c.low).collect();
+        let atr_val = atr(&highs, &lows, &closes, 14)[n - 1].unwrap_or(0.0);
         let atr_pct = if last > 0.0 { atr_val / last } else { 0.0 };
         if !(0.0005..0.08).contains(&atr_pct) {
             score -= 15.0;
-            reasons.push("volatility".to_string());
+            reasons.push("volatility out of range".to_string());
         }
 
-        // Gold scalper boost
-        if market == Market::Gold && scale_gold(symbol) {
+        // Gold boost
+        if market == Market::Gold && matches!(symbol, "XAU_USD" | "XAUUSD" | "XAU/USD") {
             score += 10.0;
             reasons.push("gold hft".to_string());
         }
@@ -216,29 +193,11 @@ impl StrategyEngine {
     }
 }
 
-fn confidence_score(rsi_val: f64, center: f64, buying: bool, macd_hist: f64) -> f64 {
-    let mut c = 0.60 + (macd_hist.abs() / 1000.0).min(0.25);
-    // RSI momentum
-    let dist = (rsi_val - center).abs() / 50.0;
-    c += dist * 0.15;
-    if buying && rsi_val > 70.0 {
-        c *= 0.8; // overbought penalty
-    }
-    if !buying && rsi_val < 30.0 {
-        c *= 0.8;
-    }
-    c.clamp(0.1, 0.95)
-}
-
 fn grade_of(score: f64) -> String {
     match score as i32 {
         80.. => "A".to_string(),
-        70.. => "B".to_string(),
-        60.. => "C".to_string(),
-        _ => "D".to_string(),
+        70..  => "B".to_string(),
+        60..  => "C".to_string(),
+        _     => "D".to_string(),
     }
-}
-
-fn scale_gold(symbol: &str) -> bool {
-    matches!(symbol, "XAU_USD" | "XAUUSD" | "XAU/USD")
 }

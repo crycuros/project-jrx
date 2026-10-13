@@ -72,6 +72,74 @@ impl AiClient {
         }
     }
 
+    /// Check whether Ollama is up. If offline, automatically attempts to spawn `ollama serve` and wait for it.
+    pub async fn ensure_running(&self) -> bool {
+        if self.ping().await {
+            return true;
+        }
+
+        log::info!("Ollama not responding at {}. Auto-starting 'ollama serve'...", self.base_url);
+        if let Err(e) = Self::spawn_ollama_process() {
+            log::warn!("Auto-start of ollama process encountered: {e}");
+        }
+
+        // Retry probe up to 10 seconds (20 iterations * 500ms)
+        for _ in 0..20 {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            if self.ping().await {
+                log::info!("Ollama server auto-started successfully and is now ONLINE.");
+                return true;
+            }
+        }
+
+        log::warn!("Timed out waiting for auto-started Ollama server.");
+        false
+    }
+
+    /// Spawns `ollama serve` detached in the background without creating a console window.
+    pub fn spawn_ollama_process() -> std::io::Result<()> {
+        let mut cmd = std::process::Command::new("ollama");
+        cmd.arg("serve");
+        cmd.stdin(std::process::Stdio::null());
+        cmd.stdout(std::process::Stdio::null());
+        cmd.stderr(std::process::Stdio::null());
+
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x08000000;
+            const DETACHED_PROCESS: u32 = 0x00000008;
+            cmd.creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS);
+        }
+
+        match cmd.spawn() {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                // Try standard Windows install location if PATH lookup fails
+                #[cfg(target_os = "windows")]
+                if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
+                    let exe = std::path::PathBuf::from(local_app_data)
+                        .join("Programs")
+                        .join("Ollama")
+                        .join("ollama.exe");
+                    if exe.exists() {
+                        use std::os::windows::process::CommandExt;
+                        const CREATE_NO_WINDOW: u32 = 0x08000000;
+                        const DETACHED_PROCESS: u32 = 0x00000008;
+                        let mut fallback_cmd = std::process::Command::new(exe);
+                        fallback_cmd.arg("serve");
+                        fallback_cmd.stdin(std::process::Stdio::null());
+                        fallback_cmd.stdout(std::process::Stdio::null());
+                        fallback_cmd.stderr(std::process::Stdio::null());
+                        fallback_cmd.creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS);
+                        return fallback_cmd.spawn().map(|_| ());
+                    }
+                }
+                Err(e)
+            }
+        }
+    }
+
     /// Evaluate a signal via the LLM and return a structured verdict.
     pub async fn evaluate_signal(&self, proposal: &Proposal, context: &str) -> Result<AiVerdict> {
         let history_ctx = self.memory.context(&proposal.symbol);

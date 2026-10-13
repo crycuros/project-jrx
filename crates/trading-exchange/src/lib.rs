@@ -19,6 +19,11 @@ pub trait Exchange: Send + Sync {
     /// Current mid price for a symbol.
     async fn fetch_price(&self, symbol: &str) -> Result<f64>;
 
+    /// Fetch historical price ticks for micro-strategy analysis.
+    async fn fetch_ticks(&self, _symbol: &str, _count: u32) -> Result<Vec<trading_core::TickRecord>> {
+        Ok(Vec::new())
+    }
+
     /// Check backend connectivity.
     async fn ping(&self) -> bool;
 

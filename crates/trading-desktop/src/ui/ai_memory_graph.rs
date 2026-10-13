@@ -1,511 +1,779 @@
-//! AI Memory Graph — the AI's brain as a living star system.
+//! AI Neural Memory Topology — 3D Volumetric Space Simulation.
 //!
-//! Three orbital tiers rendered on a canvas:
-//!   • Core  — the AI engine itself (glowing cyan/white star, pulses with heartbeat)
-//!   • Inner — live Strategy Signal nodes  (GO=green, WATCH=amber, NO-GO=red)
-//!   • Mid   — Regime Memory nodes (BULL/BEAR/RANGING/BREAKOUT)
-//!   • Outer — Asset Universe nodes (colored by market: forex=blue, gold=yellow)
-//!
-//! Background: procedural star field that slowly drifts.
-//! Edges: confidence-weighted arcs from core to signal nodes, regime to asset nodes.
+//! Features:
+//!   • Full 3D perspective projection with depth sorting (Z-buffer / Painter's algorithm)
+//!   • Interactive 3D camera controls: Left-drag = 3D Orbit Rotate, Wheel = 3D Zoom
+//!   • Volumetric 3D glowing starfield with stellar parallax
+//!   • Multi-tier tilted celestial orbital planes with depth gradient
+//!   • Pulsating central AI Singularity with coronal plasma glow shells & solar flares
+//!   • 3D Synaptic energy rays with live streaming photon data packets
+//!   • Directional shaded 3D node spheres with billboarded depth-scaled labels
+//!   • Interactive 3D hit testing and holographic tooltip cards
 
-use iced::mouse;
-use iced::widget::canvas::{self, Canvas, Fill, Frame, Geometry, Path, Stroke, Text};
-use iced::{Color, Element, Length, Point, Rectangle, Renderer, Theme};
-
+use egui::{
+    pos2, vec2, Align2, Color32, FontFamily, FontId, Pos2, Rect, Rounding, Stroke, Ui,
+};
 use trading_core::{AiMemoryNode, MemoryOrbit, NodeVerdict, Status};
 
-use super::components::panel;
 use crate::theme::C;
 
-// *one italic private thought* — this graph doesn't lie; it shows exactly what the machine is thinking.
-
-pub struct GalaxyState {
-    hovered: Option<(u8, usize)>,
+#[derive(Clone)]
+pub struct NeuralMemoryState {
+    pub yaw: f32,
+    pub pitch: f32,
+    pub zoom: f32,
+    pub auto_orbit: bool,
+    pub hovered: Option<(u8, usize)>,
+    pub selected: Option<(u8, usize)>,
 }
-impl Default for GalaxyState {
+
+impl Default for NeuralMemoryState {
     fn default() -> Self {
-        Self { hovered: None }
+        Self {
+            yaw: 0.45,
+            pitch: 0.55,
+            zoom: 1.0,
+            auto_orbit: true,
+            hovered: None,
+            selected: None,
+        }
     }
 }
 
-pub fn view<'a, M: 'a + 'static>(nodes: &[AiMemoryNode], status: &Status) -> Element<'a, M> {
-    let nodes = if nodes.is_empty() { placeholder_nodes() } else { nodes.to_vec() };
-    let running = status.running;
-    let regime  = status.engine.clone();
-    let ai_ok   = status.ai_available;
-    let program = GalaxyView { nodes, running, regime, ai_ok };
-
-    let right_label = super::components::mono_color(
-        format!("AI {} · MEM {} NODES", if ai_ok { "ONLINE" } else { "OFFLINE" }, program.nodes.len()),
-        if ai_ok { C::cyan() } else { C::dim() },
-    );
-    panel(
-        "AI MEMORY GRAPH",
-        Some(right_label),
-        Canvas::new(program).width(Length::Fill).height(Length::Fill),
-    )
+#[derive(Clone, Copy)]
+struct Vec3 {
+    x: f32,
+    y: f32,
+    z: f32,
 }
 
-pub struct GalaxyView {
-    nodes:   Vec<AiMemoryNode>,
-    running: bool,
-    #[allow(dead_code)]
-    regime:  String,
-    ai_ok:   bool,
+impl Vec3 {
+    fn new(x: f32, y: f32, z: f32) -> Self {
+        Self { x, y, z }
+    }
 }
 
-// ── orbit radii (fraction of min(w,h)/2) ──────────────────────────────────────
-const R_INNER: f32 = 0.24;
-const R_MID:   f32 = 0.42;
-const R_OUTER: f32 = 0.60;
-
-/// Node position on a ring (reused by draw + hover hit-testing so the cursor
-/// always matches what is rendered).
-fn orbit_pos(count: usize, r_frac: f32, phase: f32, speed: f32, cx: f32, cy: f32, rbase: f32, t: f32) -> Vec<(f32, f32)> {
-    let n = count.max(1) as f32;
-    let r = rbase * r_frac;
-    (0..count)
-        .map(|i| {
-            let angle = (i as f32 / n) * std::f32::consts::TAU + phase + t * speed;
-            let wobble_r = r + (t * 0.7 + i as f32 * 0.9).sin() * rbase * 0.015;
-            (cx + angle.cos() * wobble_r, cy + angle.sin() * wobble_r)
-        })
-        .collect()
+struct Projected3D {
+    screen: Pos2,
+    depth: f32,
+    scale: f32,
 }
 
-/// (orbit, index) of the node under the cursor, else None.
-fn hit_test(
-    signals: usize,
-    regimes: usize,
-    assets: usize,
-    signal_pos: &[(f32, f32)],
-    regime_pos: &[(f32, f32)],
-    asset_pos: &[(f32, f32)],
-    cpos: Point,
-) -> Option<(u8, usize)> {
-    let hit = |pos: &[(f32, f32)], i: usize| {
-        let (x, y) = pos[i];
-        let dx = cpos.x - x;
-        let dy = cpos.y - y;
-        dx * dx + dy * dy <= 90.0 * 90.0
+fn project_3d(
+    p: Vec3,
+    yaw: f32,
+    pitch: f32,
+    zoom: f32,
+    center: Pos2,
+    world_scale: f32,
+) -> Projected3D {
+    // 1. Yaw rotation (Y axis)
+    let (sin_y, cos_y) = yaw.sin_cos();
+    let x1 = p.x * cos_y - p.z * sin_y;
+    let z1 = p.x * sin_y + p.z * cos_y;
+    let y1 = p.y;
+
+    // 2. Pitch rotation (X axis)
+    let (sin_p, cos_p) = pitch.sin_cos();
+    let y2 = y1 * cos_p - z1 * sin_p;
+    let z2 = y1 * sin_p + z1 * cos_p;
+    let x2 = x1;
+
+    // 3. Perspective Camera
+    let cam_dist = 550.0 * zoom;
+    let z_depth = (z2 + cam_dist).max(20.0);
+    let fov = 420.0;
+    let scale = (fov / z_depth) * (world_scale / 120.0);
+
+    let sx = center.x + x2 * scale;
+    let sy = center.y + y2 * scale;
+
+    Projected3D {
+        screen: pos2(sx, sy),
+        depth: z_depth,
+        scale,
+    }
+}
+
+enum DrawItem<'a> {
+    Star {
+        screen: Pos2,
+        depth: f32,
+        radius: f32,
+        color: Color32,
+        flare: bool,
+    },
+    RingSegment {
+        p1: Pos2,
+        p2: Pos2,
+        depth: f32,
+        color: Color32,
+        glow_color: Color32,
+        width: f32,
+    },
+    SynapseRay {
+        p1: Pos2,
+        p2: Pos2,
+        depth: f32,
+        color: Color32,
+        glow_color: Color32,
+        width: f32,
+        photon: Option<Pos2>,
+        photon_color: Color32,
+    },
+    CoreHalo {
+        screen: Pos2,
+        depth: f32,
+        radius: f32,
+        color: Color32,
+    },
+    CoreBody {
+        screen: Pos2,
+        depth: f32,
+        radius: f32,
+        heartbeat: f32,
+    },
+    NodeSphere {
+        orbit_type: u8,
+        idx: usize,
+        screen: Pos2,
+        depth: f32,
+        radius: f32,
+        node: &'a AiMemoryNode,
+        is_focus: bool,
+    },
+}
+
+impl<'a> DrawItem<'a> {
+    fn depth(&self) -> f32 {
+        match self {
+            DrawItem::Star { depth, .. } => *depth,
+            DrawItem::RingSegment { depth, .. } => *depth,
+            DrawItem::SynapseRay { depth, .. } => *depth,
+            DrawItem::CoreHalo { depth, .. } => *depth,
+            DrawItem::CoreBody { depth, .. } => *depth,
+            DrawItem::NodeSphere { depth, .. } => *depth,
+        }
+    }
+}
+
+pub fn view(
+    ui: &mut Ui,
+    state: &mut NeuralMemoryState,
+    nodes: &[AiMemoryNode],
+    _status: &Status,
+) {
+    let nodes = if nodes.is_empty() {
+        placeholder_nodes()
+    } else {
+        nodes.to_vec()
     };
-    for i in 0..signals {
-        if hit(signal_pos, i) {
-            return Some((0, i));
+
+    let (response, painter) = ui.allocate_painter(
+        ui.available_size(),
+        egui::Sense::click_and_drag(),
+    );
+    let bounds = response.rect;
+
+    if !ui.is_rect_visible(bounds) || bounds.width() < 10.0 || bounds.height() < 10.0 {
+        return;
+    }
+
+    let time = ui.input(|i| i.time) as f32;
+    let dt = ui.input(|i| i.stable_dt).min(0.05) as f32;
+
+    // ── 1. Interactive 3D Camera Controls (Fluid, Zero-Snapping) ──────────────
+    if response.dragged() {
+        let delta = response.drag_delta();
+        state.yaw += delta.x * 0.006;
+        state.pitch = (state.pitch + delta.y * 0.006).clamp(-1.45, 1.45);
+    } else if state.auto_orbit {
+        // Continuous celestial rotation without any snap jumps
+        state.yaw += dt * 0.12;
+    }
+
+    if response.hovered() {
+        let scroll = ui.input(|i| i.raw_scroll_delta.y);
+        if scroll.abs() > 0.01 {
+            state.zoom = (state.zoom - scroll * 0.0015).clamp(0.40, 2.8);
         }
     }
-    for i in 0..regimes {
-        if hit(regime_pos, i) {
-            return Some((1, i));
-        }
+
+    let current_yaw = state.yaw;
+    let current_pitch = state.pitch;
+    let current_zoom = state.zoom;
+
+    let center = bounds.center();
+    let world_scale = (bounds.width().min(bounds.height()) * 0.46).max(50.0);
+
+    // ── 2. Monochrome Obsidian & Subtle White Radial Vignette ────────────────
+    let nebula_r = world_scale * 1.8;
+    for (step_r, col) in [
+        (nebula_r * 1.00, Color32::from_rgba_unmultiplied(255, 255, 255, 3)),
+        (nebula_r * 0.72, Color32::from_rgba_unmultiplied(255, 255, 255, 5)),
+        (nebula_r * 0.45, Color32::from_rgba_unmultiplied(255, 255, 255, 8)),
+        (nebula_r * 0.24, Color32::from_rgba_unmultiplied(255, 255, 255, 14)),
+    ] {
+        painter.circle_filled(center, step_r, col);
     }
-    for i in 0..assets {
-        if hit(asset_pos, i) {
-            return Some((2, i));
-        }
-    }
-    None
-}
 
-fn verdict_color(v: NodeVerdict) -> Color {
-    match v {
-        NodeVerdict::Go      => Color { r: 0.18, g: 0.95, b: 0.45, a: 1.0 },
-        NodeVerdict::Watch   => Color { r: 1.0,  g: 0.72, b: 0.0,  a: 1.0 },
-        NodeVerdict::NoGo    => Color { r: 0.95, g: 0.18, b: 0.18, a: 1.0 },
-        NodeVerdict::Neutral => Color { r: 0.4,  g: 0.6,  b: 0.9,  a: 1.0 },
-    }
-}
+    let mut draw_queue: Vec<DrawItem> = Vec::with_capacity(400);
 
-fn market_color(m: trading_core::Market) -> Color {
-    match m {
-        trading_core::Market::Forex => Color { r: 0.2,  g: 0.55, b: 1.0,  a: 1.0 },
-        trading_core::Market::Gold   => Color { r: 1.0,  g: 0.80, b: 0.1,  a: 1.0 },
-    }
-}
+    // ── 3. Volumetric 3D Monochrome Starfield ────────────────────────────────
+    for i in 0u32..120 {
+        let u = (i as f32 * 137.508).fract();
+        let v = (i as f32 * 53.371).fract();
+        let theta = u * std::f32::consts::TAU;
+        let phi = (v * 2.0 - 1.0).asin();
+        let dist = 210.0 + (i as f32 * 19.17).fract() * 150.0;
 
-fn alpha(c: Color, a: f32) -> Color { Color { a: a * c.a, ..c } }
-
-impl<Message: 'static> canvas::Program<Message> for GalaxyView {
-    type State = GalaxyState;
-
-    fn draw(
-        &self,
-        _state: &GalaxyState,
-        renderer: &Renderer,
-        _theme: &Theme,
-        bounds: Rectangle,
-        cursor: mouse::Cursor,
-    ) -> Vec<Geometry> {
-        let mut frame = Frame::new(renderer, bounds.size());
-
-        let w  = bounds.width;
-        let h  = bounds.height;
-        let cx = w / 2.0;
-        let cy = h / 2.0;
-        let rbase = (w.min(h) * 0.5).max(40.0);
-
-        // ── time clock ────────────────────────────────────────────────────────
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default();
-        let t = now.as_millis() as f32 / 1000.0;  // seconds float
-
-        // ═══════════════════════════════════════════════════════════════════════
-        // 1. STAR FIELD  (180 procedural stars, slow parallax drift)
-        // ═══════════════════════════════════════════════════════════════════════
-        for i in 0u32..180 {
-            let seed = (i as f32 * 137.508).fract() * 6.283;
-            let seed2 = (i as f32 * 53.371).fract();
-            let sx = (seed.cos() * 0.5 + 0.5) * w + (t * 0.06 + seed).sin() * 1.8;
-            let sy = (seed2 * h) + (t * 0.04 + seed2 * 6.28).cos() * 1.5;
-            let brightness = 0.08 + seed2 * 0.20;
-            let size = 0.6 + seed2 * 1.0;
-            let star = Path::circle(Point::new(sx % w, sy % h), size);
-            frame.fill(&star, Fill {
-                style: Color { r: brightness * 0.85, g: brightness * 0.9, b: brightness, a: brightness }.into(),
-                ..Default::default()
-            });
-        }
-
-        // ═══════════════════════════════════════════════════════════════════════
-        // 2. ORBIT RINGS
-        // ═══════════════════════════════════════════════════════════════════════
-        for (r_frac, ring_col) in [
-            (R_INNER, Color { r: 0.1, g: 0.7,  b: 0.9,  a: 0.10 }),
-            (R_MID,   Color { r: 0.4, g: 0.4,  b: 1.0,  a: 0.08 }),
-            (R_OUTER, Color { r: 0.6, g: 0.2,  b: 1.0,  a: 0.07 }),
-        ] {
-            let r = rbase * r_frac;
-            let segs = 96usize;
-            for s in 0..segs {
-                if s % 3 == 0 { continue; }
-                let a0 = (s as f32 / segs as f32) * std::f32::consts::TAU;
-                let a1 = ((s + 1) as f32 / segs as f32) * std::f32::consts::TAU;
-                let arc = Path::line(
-                    Point::new(cx + a0.cos() * r, cy + a0.sin() * r),
-                    Point::new(cx + a1.cos() * r, cy + a1.sin() * r),
-                );
-                frame.stroke(&arc, Stroke { style: ring_col.into(), width: 1.0, ..Default::default() });
-            }
-        }
-
-        // ═══════════════════════════════════════════════════════════════════════
-        // 3. CORE AI STAR
-        // ═══════════════════════════════════════════════════════════════════════
-        let heartbeat = (t * 1.8).sin() * 0.5 + 0.5;
-        let core_col = if self.ai_ok {
-            Color { r: 0.1, g: 0.95, b: 1.0, a: 1.0 }
-        } else {
-            Color { r: 0.5, g: 0.5, b: 0.5, a: 0.6 }
-        };
-
-        for (halo_r, halo_a) in [
-            (rbase * 0.15, 0.04f32),
-            (rbase * 0.09, 0.07),
-            (rbase * 0.055, 0.12),
-        ] {
-            let halo_size = halo_r + heartbeat * halo_r * 0.18;
-            let halo = Path::circle(Point::new(cx, cy), halo_size);
-            frame.fill(&halo, Fill { style: alpha(core_col, halo_a + heartbeat * 0.03).into(), ..Default::default() });
-        }
-
-        let core_r = 7.0 + heartbeat * 2.5;
-        let core = Path::circle(Point::new(cx, cy), core_r);
-        frame.fill(&core, Fill { style: core_col.into(), ..Default::default() });
-
-        for spike_angle in [0.0f32, std::f32::consts::FRAC_PI_2, std::f32::consts::PI, std::f32::consts::FRAC_PI_2 * 3.0] {
-            let spike_len = rbase * 0.06 * (0.7 + heartbeat * 0.3);
-            let spike_path = Path::line(
-                Point::new(cx + spike_angle.cos() * core_r, cy + spike_angle.sin() * core_r),
-                Point::new(cx + spike_angle.cos() * spike_len, cy + spike_angle.sin() * spike_len),
-            );
-            frame.stroke(&spike_path, Stroke {
-                style: alpha(core_col, 0.6 + heartbeat * 0.3).into(),
-                width: 1.5 + heartbeat,
-                ..Default::default()
-            });
-        }
-
-        // ═══════════════════════════════════════════════════════════════════════
-        // 4. PARTITION NODES
-        // ═══════════════════════════════════════════════════════════════════════
-        let signals: Vec<&AiMemoryNode> = self.nodes.iter().filter(|n| n.orbit == MemoryOrbit::Signal).collect();
-        let regimes: Vec<&AiMemoryNode> = self.nodes.iter().filter(|n| n.orbit == MemoryOrbit::Regime).collect();
-        let assets:  Vec<&AiMemoryNode> = self.nodes.iter().filter(|n| n.orbit == MemoryOrbit::Asset).collect();
-
-        let signal_pos: Vec<(f32, f32)> = orbit_pos(signals.len(), R_INNER, 0.3, 0.18, cx, cy, rbase, t);
-        let regime_pos: Vec<(f32, f32)> = orbit_pos(regimes.len(), R_MID,   1.1, 0.07, cx, cy, rbase, t);
-        let asset_pos:  Vec<(f32, f32)> = orbit_pos(assets.len(),  R_OUTER, 0.0, 0.035, cx, cy, rbase, t);
-
-        // ═══════════════════════════════════════════════════════════════════════
-        // 5. EDGES
-        // ═══════════════════════════════════════════════════════════════════════
-        for (i, node) in signals.iter().enumerate() {
-            let (nx, ny) = signal_pos[i];
-            let edge_alpha = (0.08 + node.confidence as f32 * 0.22)
-                * (0.7 + (t * 2.5 + i as f32 * 0.8).sin() * 0.3);
-            let ec = alpha(verdict_color(node.verdict), edge_alpha);
-            let edge = Path::line(Point::new(cx, cy), Point::new(nx, ny));
-            frame.stroke(&edge, Stroke {
-                style: ec.into(),
-                width: 0.5 + node.confidence as f32 * 1.5,
-                ..Default::default()
-            });
-        }
-
-        for (ri, _rnode) in regimes.iter().enumerate() {
-            for (ai, anode) in assets.iter().enumerate() {
-                if (ri * 3 + ai) % 5 != 0 { continue; }
-                let (rx, ry) = regime_pos[ri];
-                let (ax, ay) = asset_pos[ai];
-                let pulse = (t * 1.2 + ri as f32 * 0.4 + ai as f32 * 0.3).sin() * 0.03;
-                let edge = Path::line(Point::new(rx, ry), Point::new(ax, ay));
-                frame.stroke(&edge, Stroke {
-                    style: alpha(market_color(anode.market), 0.06 + pulse.abs()).into(),
-                    width: 0.4,
-                    ..Default::default()
-                });
-            }
-        }
-
-        // ═══════════════════════════════════════════════════════════════════════
-        // 6. DRAW NODES
-        // ═══════════════════════════════════════════════════════════════════════
-        let draw_node = |frame: &mut Frame, nx: f32, ny: f32, node: &AiMemoryNode, base_r: f32| {
-            let col = verdict_color(node.verdict);
-            let market_col = market_color(node.market);
-            let pulse = (t * 1.6 + nx * 0.01).sin() * 0.5 + 0.5;
-            let r = base_r * (0.85 + node.confidence as f32 * 0.30 + pulse * 0.10);
-
-            let glow = Path::circle(Point::new(nx, ny), r * 2.5);
-            frame.fill(&glow, Fill { style: alpha(col, 0.07 + pulse * 0.04).into(), ..Default::default() });
-
-            let ring = Path::circle(Point::new(nx, ny), r + 2.5);
-            frame.stroke(&ring, Stroke {
-                style: alpha(market_col, 0.35 + if node.active { pulse * 0.5 } else { 0.0 }).into(),
-                width: 1.0 + if node.active { 1.5 } else { 0.0 },
-                ..Default::default()
-            });
-
-            let body = Path::circle(Point::new(nx, ny), r);
-            frame.fill(&body, Fill { style: alpha(col, 0.80).into(), ..Default::default() });
-
-            if node.active {
-                let active_ring = Path::circle(Point::new(nx, ny), r * 2.8);
-                frame.stroke(&active_ring, Stroke {
-                    style: alpha(col, 0.25 + pulse * 0.25).into(),
-                    width: 1.5,
-                    ..Default::default()
-                });
-            }
-
-            frame.fill_text(Text {
-                content: node.label.clone(),
-                position: Point::new(nx + r + 3.5, ny - 5.5),
-                color: Color { a: 0.85, ..C::text2() },
-                size: iced::Pixels(8.0),
-                ..Default::default()
-            });
-
-            if node.confidence > 0.01 {
-                frame.fill_text(Text {
-                    content: format!("{:.0}%", node.confidence * 100.0),
-                    position: Point::new(nx - 6.0, ny + r + 3.0),
-                    color: alpha(col, 0.75),
-                    size: iced::Pixels(7.0),
-                    ..Default::default()
-                });
-            }
-        };
-
-        for (i, node) in signals.iter().enumerate() {
-            let (nx, ny) = signal_pos[i];
-            draw_node(&mut frame, nx, ny, node, 5.5);
-        }
-        for (i, node) in regimes.iter().enumerate() {
-            let (nx, ny) = regime_pos[i];
-            draw_node(&mut frame, nx, ny, node, 6.5);
-        }
-        for (i, node) in assets.iter().enumerate() {
-            let (nx, ny) = asset_pos[i];
-            draw_node(&mut frame, nx, ny, node, 5.0);
-        }
-
-        // ── hovered node: highlight + tooltip with its memory/pattern detail ──
-        if let Some(cpos) = cursor.position_in(bounds) {
-            let cpos = Point::new(cpos.x, cpos.y);
-            let hovered = hit_test(
-                signals.len(), regimes.len(), assets.len(),
-                &signal_pos, &regime_pos, &asset_pos,
-                cpos,
-            );
-            let hovered_node: Option<(&AiMemoryNode, (f32, f32), f32)> = match hovered {
-                Some((0, i)) => signals.get(i).map(|n| (*n, signal_pos[i], 5.5)),
-                Some((1, i)) => regimes.get(i).map(|n| (*n, regime_pos[i], 6.5)),
-                Some((2, i)) => assets.get(i).map(|n| (*n, asset_pos[i], 5.0)),
-                _ => None,
-            };
-            if let Some((node, (nx, ny), base_r)) = hovered_node {
-                let col = verdict_color(node.verdict);
-                // highlight ring
-                let hl = Path::circle(Point::new(nx, ny), base_r * 2.2);
-                frame.stroke(&hl, Stroke {
-                    style: alpha(col, 0.55).into(),
-                    width: 2.0,
-                    ..Default::default()
-                });
-
-                // tooltip box
-                let tip_lines: Vec<String> = node.detail.lines()
-                    .filter(|l| !l.trim().is_empty())
-                    .map(|l| l.trim().to_string())
-                    .collect();
-                let tip_h = 16.0 + tip_lines.len() as f32 * 12.0;
-                let tip_w = tip_lines.iter().map(|l| (l.len() as f32 * 5.8).min(300.0)).fold(150.0f32, f32::max) + 20.0;
-
-                let mut bx = nx + base_r + 16.0;
-                if bx + tip_w > w - 6.0 {
-                    bx = nx - base_r - 16.0 - tip_w;
-                }
-                if bx < 6.0 {
-                    bx = 6.0;
-                }
-                let mut by = ny - 12.0;
-                if by + tip_h > h - 6.0 {
-                    by = h - 6.0 - tip_h;
-                }
-                if by < 6.0 {
-                    by = 6.0;
-                }
-
-                let box_r = Path::rectangle(Point::new(bx, by), iced::Size::new(tip_w, tip_h));
-                frame.fill(&box_r, Fill { style: Color { r: 0.03, g: 0.05, b: 0.1, a: 0.92 }.into(), ..Default::default() });
-                frame.stroke(&box_r, Stroke { style: alpha(col, 0.5).into(), width: 1.0, ..Default::default() });
-
-                frame.fill_text(Text {
-                    content: format!("{} · {:.0}%", node.label, node.confidence * 100.0),
-                    position: Point::new(bx + 8.0, by + 8.0),
-                    color: col,
-                    size: iced::Pixels(10.0),
-                    ..Default::default()
-                });
-                for (li, line) in tip_lines.iter().enumerate() {
-                    frame.fill_text(Text {
-                        content: line.clone(),
-                        position: Point::new(bx + 10.0, by + 24.0 + li as f32 * 12.0),
-                        color: Color { a: 0.9, ..C::text2() },
-                        size: iced::Pixels(8.5),
-                        ..Default::default()
-                    });
-                }
-            }
-        }
-
-        // ═══════════════════════════════════════════════════════════════════════
-        // 7. CORE LABEL + STATUS STRIP
-        // ═══════════════════════════════════════════════════════════════════════
-        frame.fill_text(Text {
-            content: "AI CORE".to_string(),
-            position: Point::new(cx - 14.0, cy + core_r + 5.0),
-            color: alpha(core_col, 0.85),
-            size: iced::Pixels(8.0),
-            ..Default::default()
-        });
-
-        let status_str = format!(
-            "SIGNAL {} · REGIME {} · ASSETS {} · ENGINE {}",
-            signals.len(), regimes.len(), assets.len(),
-            if self.running { "LIVE" } else { "IDLE" },
+        let star_3d = Vec3::new(
+            dist * phi.cos() * theta.cos(),
+            dist * phi.sin(),
+            dist * phi.cos() * theta.sin(),
         );
-        frame.fill_text(Text {
-            content: status_str,
-            position: Point::new(6.0, 4.0),
-            color: if self.ai_ok { C::cyan() } else { C::dim() },
-            size: iced::Pixels(9.0),
-            ..Default::default()
-        });
 
-        vec![frame.into_geometry()]
+        let p = project_3d(star_3d, current_yaw * 0.4, current_pitch * 0.4, current_zoom, center, world_scale);
+        if bounds.contains(p.screen) {
+            let twinkle = ((time * 2.0 + i as f32 * 1.7).sin() * 0.5 + 0.5) * 0.4 + 0.6;
+            let alpha = ((45.0 + v * 120.0) * p.scale.clamp(0.5, 1.4) * twinkle).clamp(15.0, 210.0) as u8;
+            let r = (0.7 + v * 0.9) * p.scale.clamp(0.6, 1.4);
+            let has_flare = i % 15 == 0;
+            let col = Color32::from_rgba_unmultiplied(244, 244, 245, alpha);
+
+            draw_queue.push(DrawItem::Star {
+                screen: p.screen,
+                depth: p.depth,
+                radius: r,
+                color: col,
+                flare: has_flare,
+            });
+        }
     }
 
-    fn mouse_interaction(&self, _state: &Self::State, bounds: Rectangle, cursor: mouse::Cursor) -> mouse::Interaction {
-        let Some(cpos) = cursor.position_in(bounds) else {
-            return mouse::Interaction::default();
-        };
-        let t = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default();
-        let t = t.as_millis() as f32 / 1000.0;
-        let cx = bounds.width / 2.0;
-        let cy = bounds.height / 2.0;
-        let rbase = (bounds.width.min(bounds.height) * 0.5).max(40.0);
+    // ── 4. 3D Tilted Monochrome Orbital Rings ────────────────────────────────
+    let ring_configs = [
+        (48.0_f32, 0.05_f32, 0.0_f32, C::with_alpha(C::WHITE, 140), C::with_alpha(C::WHITE, 22)),
+        (88.0_f32, 0.35_f32, 0.2_f32, C::with_alpha(C::TEXT_MUTED, 110), C::with_alpha(C::TEXT_MUTED, 18)),
+        (132.0_f32, -0.45_f32, -0.3_f32, C::with_alpha(C::TEXT_DIM, 95), C::with_alpha(C::TEXT_DIM, 14)),
+    ];
 
-        let signals: Vec<&AiMemoryNode> = self.nodes.iter().filter(|n| n.orbit == MemoryOrbit::Signal).collect();
-        let regimes: Vec<&AiMemoryNode> = self.nodes.iter().filter(|n| n.orbit == MemoryOrbit::Regime).collect();
-        let assets:  Vec<&AiMemoryNode> = self.nodes.iter().filter(|n| n.orbit == MemoryOrbit::Asset).collect();
+    for &(radius, tilt_x, tilt_z, ring_col, glow_col) in &ring_configs {
+        const SEGMENTS: usize = 40;
+        let mut prev_pt: Option<Projected3D> = None;
+        let mut first_pt: Option<Projected3D> = None;
 
-        let signal_pos = orbit_pos(signals.len(), R_INNER, 0.3, 0.18, cx, cy, rbase, t);
-        let regime_pos = orbit_pos(regimes.len(), R_MID,   1.1, 0.07, cx, cy, rbase, t);
-        let asset_pos  = orbit_pos(assets.len(),  R_OUTER, 0.0, 0.035, cx, cy, rbase, t);
+        for s in 0..=SEGMENTS {
+            let angle = (s as f32 / SEGMENTS as f32) * std::f32::consts::TAU;
+            let raw_x = radius * angle.cos();
+            let raw_z = radius * angle.sin();
+            let raw_y = raw_x * tilt_x + raw_z * tilt_z;
 
-        if hit_test(signals.len(), regimes.len(), assets.len(), &signal_pos, &regime_pos, &asset_pos, cpos).is_some() {
-            mouse::Interaction::Pointer
-        } else {
-            mouse::Interaction::default()
+            let pt = project_3d(
+                Vec3::new(raw_x, raw_y, raw_z),
+                current_yaw,
+                current_pitch,
+                current_zoom,
+                center,
+                world_scale,
+            );
+
+            if let Some(prev) = prev_pt {
+                let mid_depth = (prev.depth + pt.depth) * 0.5;
+                draw_queue.push(DrawItem::RingSegment {
+                    p1: prev.screen,
+                    p2: pt.screen,
+                    depth: mid_depth,
+                    color: ring_col,
+                    glow_color: glow_col,
+                    width: (1.0 * pt.scale).clamp(0.6, 1.8),
+                });
+            } else {
+                first_pt = Some(Projected3D { screen: pt.screen, depth: pt.depth, scale: pt.scale });
+            }
+            prev_pt = Some(pt);
+        }
+
+        if let (Some(prev), Some(first)) = (prev_pt, first_pt) {
+            let mid_depth = (prev.depth + first.depth) * 0.5;
+            draw_queue.push(DrawItem::RingSegment {
+                p1: prev.screen,
+                p2: first.screen,
+                depth: mid_depth,
+                color: ring_col,
+                glow_color: glow_col,
+                width: 1.0,
+            });
+        }
+    }
+
+    // ── 5. Central Monochrome Stark-White AI Core ────────────────────────────
+    let core_pt = project_3d(Vec3::new(0.0, 0.0, 0.0), current_yaw, current_pitch, current_zoom, center, world_scale);
+    let heartbeat = (time * 2.4).sin() * 0.5 + 0.5;
+
+    let halo_layers = [
+        (95.0_f32, Color32::from_rgba_unmultiplied(250, 250, 250, 8)),
+        (68.0_f32, Color32::from_rgba_unmultiplied(250, 250, 250, 16)),
+        (46.0_f32, Color32::from_rgba_unmultiplied(250, 250, 250, 28)),
+        (30.0_f32, Color32::from_rgba_unmultiplied(250, 250, 250, 55)),
+        (20.0_f32, Color32::from_rgba_unmultiplied(255, 255, 255, 110)),
+    ];
+
+    for (hr, col) in halo_layers {
+        let r = (hr + heartbeat * 3.0) * core_pt.scale * 0.85;
+        draw_queue.push(DrawItem::CoreHalo {
+            screen: core_pt.screen,
+            depth: core_pt.depth + 1.0,
+            radius: r,
+            color: col,
+        });
+    }
+
+    draw_queue.push(DrawItem::CoreBody {
+        screen: core_pt.screen,
+        depth: core_pt.depth,
+        radius: (15.0 + heartbeat * 1.5) * core_pt.scale * 0.85,
+        heartbeat,
+    });
+
+    // ── 6. 3D Orbital Node Coordinates & Synaptic Laser Rays ──────────────────
+    let signals: Vec<&AiMemoryNode> = nodes.iter().filter(|n| n.orbit == MemoryOrbit::Signal).collect();
+    let regimes: Vec<&AiMemoryNode> = nodes.iter().filter(|n| n.orbit == MemoryOrbit::Regime).collect();
+    let assets: Vec<&AiMemoryNode> = nodes.iter().filter(|n| n.orbit == MemoryOrbit::Asset).collect();
+
+    let active_focus = state.selected.or(state.hovered);
+
+    // Compute 3D node positions
+    let compute_3d_nodes = |items: &[&AiMemoryNode], radius: f32, tilt_x: f32, tilt_z: f32, speed: f32, orbit_offset: f32| -> Vec<(Vec3, Projected3D)> {
+        let count = items.len().max(1);
+        (0..items.len()).map(|i| {
+            let angle = (i as f32 / count as f32) * std::f32::consts::TAU + time * speed + orbit_offset;
+            let rx = radius * angle.cos();
+            let rz = radius * angle.sin();
+            let ry = rx * tilt_x + rz * tilt_z + (time * 1.8 + i as f32).sin() * 4.0;
+            let v3 = Vec3::new(rx, ry, rz);
+            let proj = project_3d(v3, current_yaw, current_pitch, current_zoom, center, world_scale);
+            (v3, proj)
+        }).collect()
+    };
+
+    let sig_3d = compute_3d_nodes(&signals, 48.0, 0.05, 0.0, 0.16, 0.2);
+    let reg_3d = compute_3d_nodes(&regimes, 88.0, 0.35, 0.2, -0.08, 1.1);
+    let ast_3d = compute_3d_nodes(&assets, 132.0, -0.45, -0.3, 0.04, 2.3);
+
+    // Synaptic Laser Beams from Core to Signals
+    for (i, node) in signals.iter().enumerate() {
+        let (_, p) = &sig_3d[i];
+        let col = verdict_color(node.verdict);
+        let photon_t = (time * 2.2 + i as f32 * 0.35).fract();
+        let photon_pos = pos2(
+            core_pt.screen.x + (p.screen.x - core_pt.screen.x) * photon_t,
+            core_pt.screen.y + (p.screen.y - core_pt.screen.y) * photon_t,
+        );
+
+        let mid_depth = (core_pt.depth + p.depth) * 0.5;
+        let alpha = (90.0 + node.confidence as f32 * 140.0).min(240.0) as u8;
+
+        draw_queue.push(DrawItem::SynapseRay {
+            p1: core_pt.screen,
+            p2: p.screen,
+            depth: mid_depth,
+            color: C::with_alpha(col, alpha),
+            glow_color: C::with_alpha(col, 50),
+            width: (1.6 * p.scale).clamp(0.8, 3.0),
+            photon: Some(photon_pos),
+            photon_color: col,
+        });
+    }
+
+    // Secondary Synaptic Arcs between Regimes and Assets
+    for (ri, _rnode) in regimes.iter().enumerate() {
+        for (ai, anode) in assets.iter().enumerate() {
+            if (ri * 2 + ai) % 3 != 0 {
+                continue;
+            }
+            let (_, rp) = &reg_3d[ri];
+            let (_, ap) = &ast_3d[ai];
+            let m_col = market_color(anode.market);
+            let mid_depth = (rp.depth + ap.depth) * 0.5;
+
+            draw_queue.push(DrawItem::SynapseRay {
+                p1: rp.screen,
+                p2: ap.screen,
+                depth: mid_depth,
+                color: C::with_alpha(m_col, 90),
+                glow_color: C::with_alpha(m_col, 30),
+                width: 0.9 * ap.scale,
+                photon: None,
+                photon_color: m_col,
+            });
+        }
+    }
+
+    // Add 3D Node Spheres to queue
+    for (i, node) in signals.iter().enumerate() {
+        let (_, p) = &sig_3d[i];
+        let is_focus = active_focus == Some((0, i));
+        draw_queue.push(DrawItem::NodeSphere {
+            orbit_type: 0,
+            idx: i,
+            screen: p.screen,
+            depth: p.depth,
+            radius: (7.2 * p.scale).clamp(3.5, 22.0),
+            node,
+            is_focus,
+        });
+    }
+
+    for (i, node) in regimes.iter().enumerate() {
+        let (_, p) = &reg_3d[i];
+        let is_focus = active_focus == Some((1, i));
+        draw_queue.push(DrawItem::NodeSphere {
+            orbit_type: 1,
+            idx: i,
+            screen: p.screen,
+            depth: p.depth,
+            radius: (8.2 * p.scale).clamp(4.0, 24.0),
+            node,
+            is_focus,
+        });
+    }
+
+    for (i, node) in assets.iter().enumerate() {
+        let (_, p) = &ast_3d[i];
+        let is_focus = active_focus == Some((2, i));
+        draw_queue.push(DrawItem::NodeSphere {
+            orbit_type: 2,
+            idx: i,
+            screen: p.screen,
+            depth: p.depth,
+            radius: (6.5 * p.scale).clamp(3.2, 19.0),
+            node,
+            is_focus,
+        });
+    }
+
+    // ── 7. Depth Sorting (Painter's Algorithm: Furthest to Nearest) ────────────
+    draw_queue.sort_by(|a, b| b.depth().partial_cmp(&a.depth()).unwrap_or(std::cmp::Ordering::Equal));
+
+    // ── 8. Render All 3D Geometry with Multi-Pass Glowing Bloom ───────────────
+    let mut hit_test_nodes: Vec<(u8, usize, Pos2, f32, &AiMemoryNode)> = Vec::new();
+
+    for item in draw_queue {
+        match item {
+            DrawItem::Star { screen, radius, color, flare, .. } => {
+                // Star glow halo
+                painter.circle_filled(screen, radius * 2.5, C::with_alpha(color, 45));
+                painter.circle_filled(screen, radius, color);
+                if flare {
+                    let flare_len = radius * 4.5;
+                    let fl_col = C::with_alpha(color, 120);
+                    painter.line_segment([pos2(screen.x - flare_len, screen.y), pos2(screen.x + flare_len, screen.y)], Stroke::new(1.0_f32, fl_col));
+                    painter.line_segment([pos2(screen.x, screen.y - flare_len), pos2(screen.x, screen.y + flare_len)], Stroke::new(1.0_f32, fl_col));
+                }
+            }
+            DrawItem::RingSegment { p1, p2, color, glow_color, width, .. } => {
+                // Pass 1: Outer wide glow stroke
+                painter.line_segment([p1, p2], Stroke::new(width * 3.5, glow_color));
+                // Pass 2: Crisp neon core
+                painter.line_segment([p1, p2], Stroke::new(width, color));
+            }
+            DrawItem::SynapseRay { p1, p2, color, glow_color, width, photon, photon_color, .. } => {
+                // Pass 1: Luminous laser beam halo
+                painter.line_segment([p1, p2], Stroke::new(width * 3.8, glow_color));
+                // Pass 2: Sharp core laser line
+                painter.line_segment([p1, p2], Stroke::new(width, color));
+
+                // Streaming High-Energy Photons
+                if let Some(pos) = photon {
+                    // Outer photon halo
+                    painter.circle_filled(pos, width * 4.0, C::with_alpha(photon_color, 70));
+                    // Mid energetic shell
+                    painter.circle_filled(pos, width * 2.0, photon_color);
+                    // Incandescent core spark
+                    painter.circle_filled(pos, width * 0.9, Color32::WHITE);
+                }
+            }
+            DrawItem::CoreHalo { screen, radius, color, .. } => {
+                painter.circle_filled(screen, radius, color);
+            }
+            DrawItem::CoreBody { screen, radius, heartbeat, .. } => {
+                // Monochrome Architectural Singularity Core
+                painter.circle_stroke(
+                    screen,
+                    radius * (1.28 + heartbeat * 0.08),
+                    Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(244, 244, 245, 70)),
+                );
+                painter.circle_filled(screen, radius * 1.02, Color32::from_rgba_unmultiplied(36, 36, 41, 255));
+                painter.circle_filled(screen, radius * 0.82, Color32::from_rgba_unmultiplied(161, 161, 170, 255));
+                painter.circle_filled(screen, radius * 0.56, Color32::from_rgba_unmultiplied(244, 244, 245, 255));
+                painter.circle_filled(screen, radius * 0.30, Color32::WHITE);
+                painter.circle_stroke(
+                    screen,
+                    radius * 1.02,
+                    Stroke::new(1.6_f32, Color32::from_rgba_unmultiplied(250, 250, 250, 220)),
+                );
+            }
+            DrawItem::NodeSphere { orbit_type, idx, screen, radius, node, is_focus, .. } => {
+                let col = verdict_color(node.verdict);
+                let m_col = market_color(node.market);
+
+                // Multi-stage Atmosphere Glow Aura
+                painter.circle_filled(
+                    screen,
+                    radius * 3.6,
+                    C::with_alpha(col, if is_focus { 90 } else { 40 }),
+                );
+                painter.circle_filled(
+                    screen,
+                    radius * 2.0,
+                    C::with_alpha(col, if is_focus { 140 } else { 75 }),
+                );
+
+                // Market Orbit Ring with Neon Stroke
+                painter.circle_stroke(
+                    screen,
+                    radius + 3.0,
+                    Stroke::new(
+                        if node.active { 2.2_f32 } else { 1.2_f32 },
+                        if node.active { m_col } else { C::with_alpha(m_col, 100) },
+                    ),
+                );
+
+                // 3D Sphere Body with Shading
+                painter.circle_filled(screen, radius, col);
+                // Specular Light Spot
+                let spec_pos = pos2(screen.x - radius * 0.30, screen.y - radius * 0.30);
+                painter.circle_filled(spec_pos, radius * 0.40, Color32::from_rgba_unmultiplied(255, 255, 255, 210));
+
+                // Focus Halo when Selected / Hovered
+                if is_focus {
+                    painter.circle_stroke(
+                        screen,
+                        radius * 3.0,
+                        Stroke::new(2.2_f32, C::CYAN),
+                    );
+                }
+
+                // Billboard 3D Holographic Text Label
+                let label_pos = pos2(screen.x + radius + 5.0, screen.y - 4.0);
+                let label_font = FontId::new((9.0 * (radius / 7.0).clamp(0.75, 1.35)).clamp(8.0, 12.0), FontFamily::Monospace);
+                
+                // Dark pill backdrop behind text
+                let text_rect = Rect::from_min_size(
+                    pos2(label_pos.x - 2.0, label_pos.y - 1.0),
+                    vec2(node.label.len() as f32 * 6.8 + 8.0, 14.0),
+                );
+                painter.rect_filled(text_rect, Rounding::same(2.0), C::with_alpha(C::BG_CARD, 210));
+                painter.rect_stroke(text_rect, Rounding::same(2.0), Stroke::new(1.0_f32, C::with_alpha(col, if is_focus { 220 } else { 110 })));
+
+                painter.text(
+                    pos2(text_rect.min.x + 4.0, text_rect.center().y),
+                    Align2::LEFT_CENTER,
+                    &node.label,
+                    label_font,
+                    if is_focus { Color32::WHITE } else { C::TEXT },
+                );
+
+                hit_test_nodes.push((orbit_type, idx, screen, radius * 2.0, node));
+            }
+        }
+    }
+
+    // ── 9. Interactive 3D Hit-Testing (Hover & Click) ─────────────────────────
+    let mut current_hover = None;
+    if let Some(cpos) = response.hover_pos() {
+        for &(orbit_type, idx, pos, hit_r, _) in hit_test_nodes.iter().rev() {
+            let dx = cpos.x - pos.x;
+            let dy = cpos.y - pos.y;
+            if dx * dx + dy * dy <= (hit_r + 8.0) * (hit_r + 8.0) {
+                current_hover = Some((orbit_type, idx));
+                break;
+            }
+        }
+    }
+    state.hovered = current_hover;
+
+    if response.clicked() {
+        state.selected = state.hovered;
+    }
+
+    // ── 10. Holographic Tooltip Card on Hover / Selection ─────────────────────
+    if let Some((orbit_type, idx)) = active_focus {
+        let hovered_info = hit_test_nodes.iter().find(|(ot, i, _, _, _)| *ot == orbit_type && *i == idx);
+        if let Some(&(_, _, screen, _, node)) = hovered_info {
+            let col = verdict_color(node.verdict);
+            let tip_w = 220.0;
+            let tip_h = 76.0;
+
+            let mut bx = screen.x + 20.0;
+            if bx + tip_w > bounds.max.x - 8.0 {
+                bx = screen.x - tip_w - 20.0;
+            }
+            let mut by = screen.y - 12.0;
+            if by + tip_h > bounds.max.y - 8.0 {
+                by = bounds.max.y - tip_h - 8.0;
+            }
+
+            let card_rect = Rect::from_min_size(pos2(bx, by), vec2(tip_w, tip_h));
+            painter.rect(
+                card_rect,
+                Rounding::same(4.0),
+                C::with_alpha(C::BG_ELEVATED, 250),
+                Stroke::new(1.4_f32, col),
+            );
+
+            // Left accent bar
+            painter.rect_filled(
+                Rect::from_min_size(card_rect.min, vec2(3.5, tip_h)),
+                Rounding::same(2.0),
+                col,
+            );
+
+            // Header line
+            painter.text(
+                pos2(bx + 10.0, by + 8.0),
+                Align2::LEFT_TOP,
+                format!("3D NEURAL CORE :: {}", node.label),
+                FontId::new(9.5, FontFamily::Monospace),
+                C::TEXT,
+            );
+
+            // Verdict & Confidence
+            painter.text(
+                pos2(bx + 10.0, by + 28.0),
+                Align2::LEFT_TOP,
+                format!("VERDICT: {:?} · CONF: {:.0}%", node.verdict, node.confidence * 100.0),
+                FontId::new(9.0, FontFamily::Monospace),
+                col,
+            );
+
+            // Detail line
+            painter.text(
+                pos2(bx + 10.0, by + 48.0),
+                Align2::LEFT_TOP,
+                &node.detail,
+                FontId::new(8.5, FontFamily::Monospace),
+                C::TEXT_MUTED,
+            );
+        }
+    }
+
+    // ── 11. Interactive HUD Floating Controls in Top-Right ────────────────────
+    let ctrl_rect = Rect::from_min_size(
+        pos2(bounds.max.x - 180.0, bounds.min.y + 8.0),
+        vec2(172.0, 22.0),
+    );
+    painter.rect_filled(ctrl_rect, Rounding::same(3.0), C::with_alpha(C::BG_CARD, 230));
+    painter.rect_stroke(ctrl_rect, Rounding::same(3.0), Stroke::new(1.0_f32, C::BORDER));
+
+    let orbit_text = if state.auto_orbit { "● ORBIT: ON" } else { "○ ORBIT: OFF" };
+    painter.text(
+        pos2(ctrl_rect.min.x + 8.0, ctrl_rect.center().y),
+        Align2::LEFT_CENTER,
+        orbit_text,
+        FontId::new(8.5, FontFamily::Monospace),
+        if state.auto_orbit { C::CYAN } else { C::AMBER },
+    );
+
+    painter.text(
+        pos2(ctrl_rect.max.x - 8.0, ctrl_rect.center().y),
+        Align2::RIGHT_CENTER,
+        "DRAG/ZOOM",
+        FontId::new(8.0, FontFamily::Monospace),
+        C::TEXT_DIM,
+    );
+
+    // Toggle orbit if clicking top-right button
+    if response.clicked() {
+        if let Some(mpos) = response.interact_pointer_pos() {
+            if ctrl_rect.contains(mpos) {
+                state.auto_orbit = !state.auto_orbit;
+            }
         }
     }
 }
 
-// ── Placeholder nodes for pre-launch state ────────────────────────────────────
+fn verdict_color(v: NodeVerdict) -> Color32 {
+    match v {
+        NodeVerdict::Go => C::GREEN,
+        NodeVerdict::Watch => C::AMBER,
+        NodeVerdict::NoGo => C::RED,
+        NodeVerdict::Neutral => C::BLUE,
+    }
+}
+
+fn market_color(m: trading_core::Market) -> Color32 {
+    match m {
+        trading_core::Market::Crypto => C::ORANGE,
+        trading_core::Market::Forex => C::BLUE,
+        trading_core::Market::Gold => C::AMBER,
+        trading_core::Market::Synthetic => C::CYAN,
+    }
+}
+
 fn placeholder_nodes() -> Vec<AiMemoryNode> {
     use trading_core::{Market, MemoryOrbit, NodeVerdict};
-    let mut nodes = Vec::new();
-
-    for (label, verdict, conf) in [
-        ("EMA_CROSS", NodeVerdict::Go,    0.82),
-        ("RSI_OB",    NodeVerdict::Watch, 0.55),
-        ("BB_BREAK",  NodeVerdict::Go,    0.74),
-        ("MACD_DIV",  NodeVerdict::NoGo,  0.31),
-    ] {
-        nodes.push(AiMemoryNode {
-            id: label.to_string(), label: label.to_string(),
-            orbit: MemoryOrbit::Signal, verdict, confidence: conf,
-                market: Market::Forex, active: verdict == NodeVerdict::Go,
-                detail: String::new(),
-        });
-    }
-
-    for (label, verdict, conf) in [
-        ("BULL",     NodeVerdict::Go,    0.68),
-        ("BEAR",     NodeVerdict::NoGo,  0.45),
-        ("RANGING",  NodeVerdict::Watch, 0.58),
-        ("BREAKOUT", NodeVerdict::Go,    0.77),
-    ] {
-        nodes.push(AiMemoryNode {
-            id: label.to_string(), label: label.to_string(),
-            orbit: MemoryOrbit::Regime, verdict, confidence: conf,
-                market: Market::Forex, active: label == "BULL",
-                detail: String::new(),
-        });
-    }
-
-    for (label, market, conf) in [
-            ("EUR_USD", Market::Forex, 0.85),
-            ("GBP_USD", Market::Forex, 0.71),
-            ("USD_JPY", Market::Forex, 0.63),
-            ("XAU_USD", Market::Gold, 0.80),
-        ("XAU_USD",  Market::Gold,   0.59),
-        ("EUR_USD",  Market::Forex,  0.52),
-        ("GBP_USD",  Market::Forex,  0.48),
-        ("USD_JPY",  Market::Forex,  0.39),
-    ] {
-        nodes.push(AiMemoryNode {
-            id: label.to_string(), label: label.to_string(),
-            orbit: MemoryOrbit::Asset, verdict: NodeVerdict::Neutral,
-                confidence: conf, market, active: label == "EUR_USD",
-                detail: String::new(),
-        });
-    }
-    nodes
+    vec![
+        AiMemoryNode {
+            id: "EMA_CROSS".into(),
+            label: "EMA_CROSS".into(),
+            orbit: MemoryOrbit::Signal,
+            verdict: NodeVerdict::Go,
+            confidence: 0.84,
+            market: Market::Forex,
+            active: true,
+            detail: "Bullish EMA 9/21 cross confirmed on 5m".into(),
+        },
+        AiMemoryNode {
+            id: "RSI_OB".into(),
+            label: "RSI_OB".into(),
+            orbit: MemoryOrbit::Signal,
+            verdict: NodeVerdict::Watch,
+            confidence: 0.58,
+            market: Market::Forex,
+            active: false,
+            detail: "RSI 62 neutral-bullish buffer".into(),
+        },
+        AiMemoryNode {
+            id: "BB_BREAK".into(),
+            label: "BB_BREAK".into(),
+            orbit: MemoryOrbit::Signal,
+            verdict: NodeVerdict::Go,
+            confidence: 0.76,
+            market: Market::Forex,
+            active: true,
+            detail: "Upper Bollinger expansion trigger".into(),
+        },
+        AiMemoryNode {
+            id: "BULL".into(),
+            label: "BULL".into(),
+            orbit: MemoryOrbit::Regime,
+            verdict: NodeVerdict::Go,
+            confidence: 0.72,
+            market: Market::Forex,
+            active: true,
+            detail: "Trend regime Bullish 4H momentum".into(),
+        },
+        AiMemoryNode {
+            id: "EUR_USD".into(),
+            label: "EUR_USD".into(),
+            orbit: MemoryOrbit::Asset,
+            verdict: NodeVerdict::Go,
+            confidence: 0.82,
+            market: Market::Forex,
+            active: true,
+            detail: "Primary active FX pair".into(),
+        },
+        AiMemoryNode {
+            id: "XAU_USD".into(),
+            label: "XAU_USD".into(),
+            orbit: MemoryOrbit::Asset,
+            verdict: NodeVerdict::Neutral,
+            confidence: 0.65,
+            market: Market::Gold,
+            active: false,
+            detail: "Gold market consolidation".into(),
+        },
+    ]
 }

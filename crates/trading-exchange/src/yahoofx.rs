@@ -215,33 +215,7 @@ mod tests {
     use super::*;
 
     fn test_config() -> Config {
-        Config {
-            oanda_token: "".into(),
-            oanda_account_id: "".into(),
-            oanda_practice: true,
-            fx_broker: "yahoo".into(),
-            deriv_token: "".into(),
-            deriv_app_id: "".into(),
-            deriv_account_id: "".into(),
-            ollama_base_url: "http://localhost:11434".into(),
-            ollama_model: "llama3.2:3b".into(),
-            default_asset: "EUR_USD".into(),
-            trading_mode: "paper".into(),
-            forex_enabled: true,
-            gold_enabled: true,
-            default_engine: "forex".into(),
-            interval_seconds: 5,
-            default_timeframe: "5m".into(),
-            forex_assets: vec!["EUR_USD".into(), "GBP_USD".into(), "USD_JPY".into()],
-            gold_assets: vec!["XAU_USD".into()],
-            max_daily_loss: 5.0,
-            max_consecutive_losses: 5,
-            max_open_positions: 3,
-            risk_per_trade_pct: 0.5,
-            data_dir: "data".into(),
-            db_path: "data/trading.db".into(),
-            log_dir: "logs".into(),
-        }
+        Config::from_env()
     }
 
     #[tokio::test]

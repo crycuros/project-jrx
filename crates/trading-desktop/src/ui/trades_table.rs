@@ -1,53 +1,73 @@
-//! Bottom-right: recent trades matrix (direction, price, win prob, P&L).
+//! Bottom-right: Recent Trades Matrix (direction, symbol, price, win prob, P&L).
 
-use iced::widget::{column, container, row, scrollable, text};
-use iced::{Element, Length};
-
+use egui::{FontFamily, FontId, Ui};
 use trading_core::{OrderSide, Trade};
 
-use super::components::{mono_color, panel};
-use crate::theme::{C, MONO, MONO_BOLD};
+use super::components::{badge, hline, mono, panel};
+use crate::theme::C;
 
-pub fn view<'a, M: 'a>(trades: &'a [Trade]) -> Element<'a, M> {
-    let header = row![
-        cell_text("DIR", Length::Fixed(52.0)),
-        cell_text("SYMBOL", Length::Fixed(90.0)),
-        cell_text("PRICE", Length::Fixed(76.0)),
-        cell_text("WIN%", Length::Fill),
-        cell_text("P&L", Length::Fill),
-    ]
-    .spacing(4);
-
-    let body = if trades.is_empty() {
-        column![mono_color("NO TRADE EXECUTIONS YET", C::dim())]
-    } else {
-        column![].extend(trades.iter().take(8).map(trade_row))
-    };
-
+pub fn view(ui: &mut Ui, trades: &[Trade]) {
     panel(
+        ui,
         "RECENT TRADES",
-        None,
-        column![header, iced::widget::horizontal_rule(1), scrollable(body)].spacing(4),
-    )
+        |ui| {
+            mono(ui, format!("{} EXECUTIONS", trades.len()), C::TEXT_DIM, 9.0);
+        },
+        |ui| {
+            ui.vertical(|ui| {
+                // Table Header
+                ui.horizontal(|ui| {
+                    ui.add_sized([45.0, 14.0], egui::Label::new(header_text("DIR")));
+                    ui.add_sized([75.0, 14.0], egui::Label::new(header_text("SYMBOL")));
+                    ui.add_sized([65.0, 14.0], egui::Label::new(header_text("PRICE")));
+                    ui.add_sized([50.0, 14.0], egui::Label::new(header_text("WIN%")));
+                    ui.add_sized([70.0, 14.0], egui::Label::new(header_text("P&L USD")));
+                });
+
+                hline(ui);
+
+                egui::ScrollArea::vertical()
+                    .id_salt("trades_table_scroll")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        if trades.is_empty() {
+                            ui.add_space(8.0);
+                            mono(ui, "NO TRADE EXECUTIONS RECORDED YET", C::TEXT_DIM, 9.0);
+                        } else {
+                            for t in trades.iter().take(8) {
+                                trade_row_view(ui, t);
+                            }
+                        }
+                    });
+            });
+        },
+    );
 }
 
-fn cell_text<'a, M: 'a>(s: impl Into<String>, w: Length) -> Element<'a, M> {
-    container(mono_color(s, C::dim())).width(w).into()
+fn header_text(s: &str) -> egui::WidgetText {
+    egui::RichText::new(s)
+        .font(FontId::new(8.5, FontFamily::Monospace))
+        .color(C::TEXT_DIM)
+        .into()
 }
 
-fn trade_row<'a, M: 'a>(t: &'a Trade) -> Element<'a, M> {
+fn trade_row_view(ui: &mut Ui, t: &Trade) {
     let long = t.side == OrderSide::Buy;
-    let dir_color = if long { C::green() } else { C::red() };
-    let dir_label = if long { "LONG" } else { "SHORT" };
+    let dir_color = if long { C::GREEN } else { C::RED };
+    let dir_label = if long { "BUY" } else { "SELL" };
 
-    // WIN% shows the actual outcome for closed trades (won=100/lost=0);
-    // for open/synced trades it falls back to the AI confidence estimate.
     let (win_pct, win_col) = match t.pnl {
-        Some(p) if p > 0.0 => (100.0, C::green()),
-        Some(_) => (0.0, C::red()),
+        Some(p) if p > 0.0 => (100.0, C::GREEN),
+        Some(_) => (0.0, C::RED),
         None => {
             let conf_pct = t.confidence * 100.0;
-            let conf_col = if conf_pct >= 70.0 { C::green() } else if conf_pct >= 50.0 { C::amber() } else { C::red() };
+            let conf_col = if conf_pct >= 70.0 {
+                C::GREEN
+            } else if conf_pct >= 50.0 {
+                C::AMBER
+            } else {
+                C::RED
+            };
             (conf_pct, conf_col)
         }
     };
@@ -59,31 +79,25 @@ fn trade_row<'a, M: 'a>(t: &'a Trade) -> Element<'a, M> {
             None => "—".to_string(),
         },
     };
-    let pnl_color = if pnl_text.starts_with('+') { C::green() } else { C::red() };
+    let pnl_color = if pnl_text.starts_with('+') { C::GREEN } else if pnl_text.starts_with('-') { C::RED } else { C::TEXT_DIM };
 
-    container(
-        row![
-            container(text(dir_label).font(MONO_BOLD).size(9).color(dir_color)).width(Length::Fixed(52.0)),
-            container(text(&t.symbol).font(MONO).size(10).color(C::text())).width(Length::Fixed(90.0)),
-            container(text(format!("{:.1}", t.entry_price)).font(MONO).size(10).color(C::text())).width(Length::Fixed(76.0)),
-            container(text(format!("{:.0}%", win_pct)).font(MONO).size(10).color(win_col)).width(Length::Fill),
-            container(text(pnl_text).font(MONO_BOLD).size(10).color(pnl_color)).width(Length::Fill),
-        ]
-        .spacing(4),
-    )
-    .style(row_style)
-    .into()
-}
-
-fn row_style(theme: &iced::Theme) -> iced::widget::container::Style {
-    let _ = theme;
-    iced::widget::container::Style {
-        background: Some(iced::Background::Color(C::bg_card())),
-        border: iced::Border {
-            color: C::border(),
-            width: 1.0,
-            radius: iced::border::Radius::from(2.0),
-        },
-        ..Default::default()
-    }
+    C::card_frame().show(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.add_sized([40.0, 16.0], |ui: &mut Ui| {
+                badge(ui, dir_label, dir_color, C::BG_ELEVATED)
+            });
+            ui.add_sized([70.0, 16.0], |ui: &mut Ui| {
+                ui.label(egui::RichText::new(&t.symbol).font(FontId::new(9.5, FontFamily::Monospace)).color(C::TEXT))
+            });
+            ui.add_sized([60.0, 16.0], |ui: &mut Ui| {
+                ui.label(egui::RichText::new(format!("{:.4}", t.entry_price)).font(FontId::new(9.5, FontFamily::Monospace)).color(C::TEXT_MUTED))
+            });
+            ui.add_sized([45.0, 16.0], |ui: &mut Ui| {
+                ui.label(egui::RichText::new(format!("{:.0}%", win_pct)).font(FontId::new(9.5, FontFamily::Monospace)).color(win_col))
+            });
+            ui.add_sized([65.0, 16.0], |ui: &mut Ui| {
+                ui.label(egui::RichText::new(pnl_text).font(FontId::new(9.5, FontFamily::Monospace)).color(pnl_color).strong())
+            });
+        });
+    });
 }

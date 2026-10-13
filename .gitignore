@@ -7,3 +7,7 @@
 /data/market_memory_cache.json
 /dist
 *.log
+/trading_memory/
+/scratch/
+__pycache__/
+*.pyc

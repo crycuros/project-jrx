@@ -5,7 +5,7 @@ pub mod models;
 
 pub use config::Config;
 pub use models::{
-    AiMemoryNode, AiVerdict, Candle, EngineMode, Instrument, JsonMap, Market, MemoryOrbit,
+    AiMemoryNode, AiVerdict, Candle, ContractMode, EngineMode, Instrument, JsonMap, LiveTick, Market, MemoryOrbit,
     NetworkNode, NewsItem, NodeVerdict, Order, OrderBook, OrderBookLevel, OrderSide, OrderStatus,
-    Position, Proposal, Status, SystemHealth, Trade, TradeStatus, UiSnapshot,
+    Position, Proposal, Regime, Status, SystemHealth, TickRecord, Trade, TradeStatus, UiSnapshot,
 };

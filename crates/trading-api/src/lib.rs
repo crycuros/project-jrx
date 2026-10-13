@@ -1,5 +1,6 @@
 //! Axum HTTP + WebSocket API for the desktop UI.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
@@ -18,6 +19,15 @@ use tokio::sync::broadcast;
 
 use trading_core::{NewsItem, Status, SystemHealth, Trade, UiSnapshot};
 
+#[derive(Debug, Clone)]
+pub struct ManualOrderRequest {
+    pub symbol: String,
+    pub side: trading_core::OrderSide,
+    pub contract_mode: trading_core::ContractMode,
+    pub stake: f64,
+    pub duration_ticks: u32,
+}
+
 /// Live mutable UI-facing model, updated by the trading loop each tick.
 #[derive(Debug, Clone, Default)]
 pub struct AppModel {
@@ -30,6 +40,10 @@ pub struct AppModel {
     pub candles: std::collections::HashMap<String, Vec<trading_core::Candle>>,
     pub order_books: std::collections::HashMap<String, trading_core::OrderBook>,
     pub historical: std::collections::HashMap<String, String>,
+    pub contract_mode: trading_core::ContractMode,
+    pub rise_fall_stake: f64,
+    pub tick_duration: u32,
+    pub pending_orders: Vec<ManualOrderRequest>,
 }
 
 /// Shared server state.
@@ -37,14 +51,67 @@ pub struct AppModel {
 pub struct AppState {
     pub model: Arc<Mutex<AppModel>>,
     pub tx: broadcast::Sender<UiSnapshot>,
+    /// Emergency stop. Read by the engine loop every tick; when true, no new
+    /// positions are opened and open ones are managed (not opened).
+    pub kill_switch: Arc<AtomicBool>,
 }
 
 impl AppState {
     pub fn new() -> Self {
         let (tx, _) = broadcast::channel(128);
         Self {
-            model: Arc::new(Mutex::new(AppModel::default())),
+            model: Arc::new(Mutex::new(AppModel {
+                contract_mode: trading_core::ContractMode::Multiplier,
+                rise_fall_stake: 0.0,
+                tick_duration: 5,
+                ..Default::default()
+            })),
             tx,
+            kill_switch: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Trip or release the emergency stop.
+    pub fn set_kill_switch(&self, on: bool) {
+        self.kill_switch.store(on, Ordering::SeqCst);
+        log::warn!("KILL SWITCH {}", if on { "ENGAGED — no new trades" } else { "released" });
+    }
+
+    pub fn kill_switch_engaged(&self) -> bool {
+        self.kill_switch.load(Ordering::SeqCst)
+    }
+
+    /// Queue a manual user order for immediate background execution.
+    pub fn queue_order(&self, req: ManualOrderRequest) {
+        if let Ok(mut m) = self.model.lock() {
+            m.pending_orders.push(req);
+        }
+    }
+
+    /// Drain all queued manual orders for execution.
+    pub fn take_pending_orders(&self) -> Vec<ManualOrderRequest> {
+        if let Ok(mut m) = self.model.lock() {
+            std::mem::take(&mut m.pending_orders)
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Update user-selected contract mode, stake, and duration.
+    pub fn set_trading_params(&self, mode: trading_core::ContractMode, stake: f64, duration: u32) {
+        if let Ok(mut m) = self.model.lock() {
+            m.contract_mode = mode;
+            m.rise_fall_stake = stake;
+            m.tick_duration = duration;
+        }
+    }
+
+    /// Get current trading parameters.
+    pub fn get_trading_params(&self) -> (trading_core::ContractMode, f64, u32) {
+        if let Ok(m) = self.model.lock() {
+            (m.contract_mode, m.rise_fall_stake, m.tick_duration)
+        } else {
+            (trading_core::ContractMode::Multiplier, 0.0, 5)
         }
     }
 
@@ -140,11 +207,9 @@ struct KillSwitchReq {
     enabled: bool,
 }
 
-async fn set_killswitch(State(_st): State<AppState>, Json(req): Json<KillSwitchReq>) -> impl IntoResponse {
-    // The trading loop owns the real kill switch; this notifies via state.
-    // Full wiring is done in the binary crate.
-    let _ = req.enabled;
-    (StatusCode::OK, Json(serde_json::json!({"ok": true, "hint": "wired in trading loop"})))
+async fn set_killswitch(State(st): State<AppState>, Json(req): Json<KillSwitchReq>) -> impl IntoResponse {
+    st.set_kill_switch(req.enabled);
+    (StatusCode::OK, Json(serde_json::json!({"ok": true, "kill_switch": req.enabled})))
 }
 
 // ── WebSocket ───────────────────────────────────────────────

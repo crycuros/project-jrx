@@ -78,13 +78,28 @@ async fn reconcile_deriv(
 ) -> f64 {
     match deriv.portfolio().await {
         Ok(contracts) => {
+            let active_ids: std::collections::HashSet<String> = contracts.iter().map(|c| c.contract_id.to_string()).collect();
+
+            // 1. Purge positions from open_trades that are no longer active in Deriv portfolio
+            open_trades.retain(|t| {
+                if t.broker == "deriv" {
+                    if let Some(ext) = &t.external_id {
+                        if !active_ids.contains(ext) {
+                            info!("reconcile: contract {ext} ({}) closed on Deriv server, removing from open positions", t.symbol);
+                            return false;
+                        }
+                    }
+                }
+                t.status == TradeStatus::Open
+            });
+
+            // 2. Add new active contracts or update existing
             for c in &contracts {
                 let ext = c.contract_id.to_string();
-                if open_trades.iter().any(|t| t.external_id.as_deref() == Some(&ext))
-                    || closed_trades.iter().any(|t| t.external_id.as_deref() == Some(&ext))
-                {
+                if closed_trades.iter().any(|t| t.external_id.as_deref() == Some(&ext)) {
                     continue;
                 }
+
                 let info = deriv.contract_info(c.contract_id).await.unwrap_or_else(|_| {
                     trading_exchange::derivfx::ContractInfo {
                         contract_id: c.contract_id,
@@ -97,27 +112,51 @@ async fn reconcile_deriv(
                     }
                 });
                 deriv_entries.insert(c.contract_id, (info.entry_spot, info.commission));
+
                 let side = if c.contract_type.starts_with("MULTDOWN") { OrderSide::Sell } else { OrderSide::Buy };
                 let market = if c.underlying == "XAU_USD" { Market::Gold } else { Market::Forex };
+                let entry_px = if info.entry_spot > 0.0 { info.entry_spot } else { c.stake };
+
+                // If already in open_trades, ensure it has valid SL/TP
+                if let Some(existing) = open_trades.iter_mut().find(|t| t.external_id.as_deref() == Some(&ext)) {
+                    if existing.entry_price <= 0.0 && entry_px > 0.0 {
+                        existing.entry_price = entry_px;
+                    }
+                    if existing.stop_loss <= 0.0 && existing.entry_price > 0.0 {
+                        existing.stop_loss = if existing.side == OrderSide::Buy { existing.entry_price * 0.985 } else { existing.entry_price * 1.015 };
+                    }
+                    if existing.take_profit <= 0.0 && existing.entry_price > 0.0 {
+                        existing.take_profit = if existing.side == OrderSide::Buy { existing.entry_price * 1.030 } else { existing.entry_price * 0.970 };
+                    }
+                    if info.current_spot != 0.0 {
+                        existing.current_price = Some(info.current_spot);
+                    }
+                    continue;
+                }
+
+                // Default dynamic SL/TP if opened directly on broker
+                let sl = if side == OrderSide::Buy { entry_px * 0.985 } else { entry_px * 1.015 };
+                let tp = if side == OrderSide::Buy { entry_px * 1.030 } else { entry_px * 0.970 };
+
                 let trade = Trade {
                     external_id: Some(ext),
                     symbol: c.underlying.clone(),
                     side,
-                    entry_price: info.entry_spot,
+                    entry_price: entry_px,
                     amount: c.stake,
+                    stop_loss: sl,
+                    take_profit: tp,
                     current_price: if info.current_spot != 0.0 { Some(info.current_spot) } else { None },
                     unrealized_pnl: None,
                     status: TradeStatus::Open,
                     broker: "deriv".to_string(),
                     entry_time: fmt_time(c.purchase_time),
                     market,
+                    reason: "synced from Deriv portfolio".to_string(),
                     ..Default::default()
                 };
-                info!("reconcile: pulled Deriv open {} {} contract_id={} stake=${:.2}", c.underlying, c.contract_type, c.contract_id, c.stake);
-                /* avoid borrow issues by inserting after the struct capture */
-                let mut head = trade;
-                head.reason = "synced from Deriv portfolio".to_string();
-                open_trades.push(head);
+                info!("reconcile: pulled Deriv open {} {} contract_id={} stake=${:.2} sl={:.4} tp={:.4}", c.underlying, c.contract_type, c.contract_id, c.stake, sl, tp);
+                open_trades.push(trade);
             }
         }
         Err(e) => warn!("deriv portfolio sync failed: {e}"),
@@ -125,6 +164,9 @@ async fn reconcile_deriv(
     if let Ok(closed) = deriv.profit_table(20).await {
         for cc in &closed {
             let ext = cc.contract_id.to_string();
+            // Ensure any trade matching this closed contract is purged from open_trades
+            open_trades.retain(|t| t.external_id.as_deref() != Some(&ext));
+
             if closed_trades.iter().any(|t| t.external_id.as_deref() == Some(&ext)) {
                 continue;
             }
@@ -244,6 +286,18 @@ async fn engine_loop(cfg: AppConfig) {
     let deriv = DerivFx::new(&config);
     let use_oanda = config.fx_broker == "oanda";
     let use_deriv = config.fx_broker == "deriv";
+
+    // ── Live-trading gate ────────────────────────────────────────────────
+    // `use_deriv` alone only says WHICH broker to talk to; it says nothing about
+    // whether real orders may be sent. Every order-placing site below requires
+    // this flag as well, so TRADING_MODE=paper can never open a real contract.
+    // `can_place_orders` is completed after the connectivity probe below.
+    let live_trading = config.is_live();
+    if live_trading {
+        info!("⚠️  LIVE TRADING ENABLED — real orders will be sent to Deriv");
+    } else {
+        info!("paper mode — no real orders will be sent (TRADING_MODE={})", config.trading_mode);
+    }
     let strategy = StrategyEngine;
     let mut risk = RiskManager::new(&config);
     let ai = AiClient::new(&config);
@@ -253,7 +307,14 @@ async fn engine_loop(cfg: AppConfig) {
     let yahoo_ok = yahoo.ping().await;
     let deriv_ok = deriv.ping().await;
     let fx_ok = if use_oanda { oanda_ok } else if use_deriv { deriv_ok } else { yahoo_ok };
-    let ollama_ok = ai.ping().await;
+    // Gate is now complete: we know the broker, the link is up, and the user
+    // explicitly opted into live. All three must hold to send a real order.
+    let can_place_orders = use_deriv && deriv_ok && live_trading;
+    info!(
+        "order gate: can_place_orders={can_place_orders} (broker={} deriv_ok={} live={})",
+        config.fx_broker, deriv_ok, live_trading
+    );
+    let mut ollama_ok = ai.ensure_running().await;
     info!("fx_broker={} oanda_ok={oanda_ok} yahoo_ok={yahoo_ok} deriv_ok={deriv_ok} ollama_ok={ollama_ok}", config.fx_broker);
     let mem = ai.memory();
     let loaded_symbols = if mem.is_empty() { 0 } else { mem.total_bars() };
@@ -263,8 +324,13 @@ async fn engine_loop(cfg: AppConfig) {
         mem.total_patterns()
     );
 
-    let mut open_trades: Vec<Trade> = Vec::new();
-    let mut closed_trades: Vec<Trade> = Vec::new();
+    let mut open_trades: Vec<Trade> = db.load_open_trades().unwrap_or_default();
+    let mut closed_trades: Vec<Trade> = db
+        .load_recent_trades(100)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|t| t.status == TradeStatus::Closed)
+        .collect();
     // contract_id -> (entry_spot, commission) for accurate Deriv P/L
     let mut deriv_entries: std::collections::HashMap<u64, (f64, f64)> = std::collections::HashMap::new();
     let mut equity_curve: Vec<(f64, f64)> = Vec::new();
@@ -285,10 +351,12 @@ async fn engine_loop(cfg: AppConfig) {
             Err(e) => warn!("deriv balance unavailable: {e}"),
         }
     }
+    risk.update_equity((equity_forex + equity_gold).max(10.0));
     let mut daily_pnl = db.load_app_state().unwrap_or_default().daily_pnl;
     let mut total_pnl = 0.0;
-    let mut consecutive_losses = 0;
-    let kill_switch = false;
+    // Restored from the DB so the loss-streak breaker survives a restart.
+    let mut consecutive_losses = db.load_app_state().unwrap_or_default().consecutive_losses;
+    // `kill_switch` is re-read from `app` inside the loop each tick.
     let forex_enabled = config.forex_enabled;
     let gold_enabled = config.gold_enabled;
     let active_engine = config.default_engine.clone();
@@ -299,11 +367,70 @@ async fn engine_loop(cfg: AppConfig) {
         net_deposits = reconcile_deriv(&deriv, &mut open_trades, &mut closed_trades, &mut deriv_entries).await;
     }
 
-    let loop_interval = Duration::from_secs(config.interval_seconds);
+    let loop_interval = Duration::from_millis(500);
     let mut tick = tokio::time::interval(loop_interval);
+    let mut tick_counter: u64 = 0;
+    let mut tick_buffers: std::collections::HashMap<String, Vec<trading_core::TickRecord>> = std::collections::HashMap::new();
+
+    // ── Continuous Deriv WebSocket Tick Streamer (Tick Collector) ────
+    let (tick_tx, mut tick_rx) = tokio::sync::mpsc::unbounded_channel::<trading_core::LiveTick>();
+    if use_deriv && deriv_ok {
+        let all_symbols: Vec<String> = config.synthetic_assets.iter()
+            .chain(config.forex_assets.iter())
+            .chain(config.gold_assets.iter())
+            .cloned()
+            .collect();
+        deriv.spawn_tick_stream(all_symbols, Some(tick_tx));
+    }
+
+    // Initial tick seeding from Deriv for instant micro-momentum readiness
+    if use_deriv && deriv_ok {
+        for a in config.synthetic_assets.iter().chain(config.forex_assets.iter()).chain(config.gold_assets.iter()) {
+            if let Ok(seed) = deriv.fetch_ticks(a, 60).await {
+                if !seed.is_empty() {
+                    info!("seeded {} ticks for {}", seed.len(), a);
+                    tick_buffers.insert(a.clone(), seed);
+                }
+            }
+        }
+    }
 
     loop {
         tick.tick().await;
+        tick_counter += 1;
+
+        // Re-read the kill switch every tick so the UI can stop trading live.
+        let kill_switch = app.kill_switch_engaged();
+        if kill_switch {
+            // Still reconcile and publish below so open positions stay visible,
+            // but the signal->order block is skipped entirely.
+            debug!("kill switch engaged — skipping new entries");
+        }
+
+        // Drain incoming continuous WebSocket ticks into buffer
+        while let Ok(live_tick) = tick_rx.try_recv() {
+            let tb = tick_buffers.entry(live_tick.symbol.clone()).or_default();
+            let is_new = tb.last().map(|last| last.epoch != live_tick.epoch || (last.price - live_tick.price).abs() > 1e-6).unwrap_or(true);
+            if is_new {
+                tb.push(trading_core::TickRecord { price: live_tick.price, epoch: live_tick.epoch });
+                if tb.len() > 120 {
+                    tb.drain(0..tb.len() - 120);
+                }
+            }
+        }
+
+        // Fetch live user parameters and manual orders from UI state
+        let (_current_contract_mode, _current_stake, _current_duration) = app.get_trading_params();
+        let pending_manual_orders = app.take_pending_orders();
+
+        // Manual orders are executed in section 3b, once live prices are known.
+
+        // Refresh Ollama status or attempt auto-start if offline
+        if !ollama_ok && tick_counter % 5 == 0 {
+            ollama_ok = ai.ensure_running().await;
+        } else if tick_counter % 15 == 0 {
+            ollama_ok = ai.ping().await;
+        }
 
         // ── 1. Status/system health ───────────────────────────────
         let market_status = if use_deriv {
@@ -328,6 +455,11 @@ async fn engine_loop(cfg: AppConfig) {
         // ── 2. Build memo list of assets to poll ──────────────────
         #[allow(clippy::type_complexity)]
         let mut targets: Vec<(String, Market)> = Vec::new();
+        if use_deriv || config.synthetic_enabled {
+            for a in &config.synthetic_assets {
+                targets.push((a.clone(), Market::Synthetic));
+            }
+        }
         if forex_enabled {
             for a in &config.forex_assets {
                 targets.push((a.clone(), Market::Forex));
@@ -339,49 +471,230 @@ async fn engine_loop(cfg: AppConfig) {
             }
         }
 
-        // ── 3. Poll prices/candles ────────────────────────────────
+        // ── 3. Poll prices/candles & live ticks in single unified pass ────
         let mut memos: Vec<MarketMemo> = Vec::new();
         for (symbol, market) in &targets {
-            let price = if use_oanda {
-                oanda.fetch_price(symbol).await.ok().unwrap_or(0.0)
-            } else if use_deriv {
-                deriv.fetch_price(symbol).await.ok().unwrap_or(0.0)
-            } else {
-                yahoo.fetch_price(symbol).await.ok().unwrap_or(0.0)
-            };
-            memos.push(MarketMemo { symbol: symbol.clone(), market: *market, candles: vec![], price });
-        }
-
-        // ── 4. Strategy signals → risk → (AI) → paper execute ─────
-        let mut order_books: std::collections::HashMap<String, trading_core::OrderBook> = std::collections::HashMap::new();
-        if !kill_switch && !memos.is_empty() {
-            // Fetch candles for the candidates that have a price.
-            for memo in memos.iter_mut() {
-                let mut candles: Option<Vec<trading_core::Candle>> = match memo.market {
-                    Market::Forex | Market::Gold => {
-                        if use_oanda {
-                            oanda.fetch_candles(&memo.symbol, &config.default_timeframe, 120).await.ok()
-                        } else if use_deriv {
-                            deriv.fetch_candles(&memo.symbol, &config.default_timeframe, 120).await.ok()
-                        } else {
-                            yahoo.fetch_candles(&memo.symbol, &config.default_timeframe, 120).await.ok()
-                        }
-                    }
-                };
-                // Some timeframes return no bars while the market is closed
-                // (e.g. 5m). Fall back to a timeframe that does, so the chart
-                // never stalls in "INITIALIZING" during the weekend.
-                if use_deriv && candles.as_ref().map(|c| c.len()).unwrap_or(0) < 2 {
-                    candles = deriv.fetch_candles(&memo.symbol, "1m", 120).await.ok();
-                    if candles.as_ref().map(|c| c.len()).unwrap_or(0) < 2 {
-                        candles = deriv.fetch_candles(&memo.symbol, "1h", 120).await.ok();
+            let mut candles: Option<Vec<trading_core::Candle>> = match market {
+                Market::Crypto | Market::Forex | Market::Gold | Market::Synthetic => {
+                    if use_oanda {
+                        oanda.fetch_candles(symbol, &config.default_timeframe, 120).await.ok()
+                    } else if use_deriv {
+                        deriv.fetch_candles(symbol, &config.default_timeframe, 120).await.ok()
+                    } else {
+                        yahoo.fetch_candles(symbol, &config.default_timeframe, 120).await.ok()
                     }
                 }
-                memo.candles = candles.unwrap_or_default();
-                if memo.price <= 0.0 {
-                    memo.price = memo.candles.last().map(|c| c.close).unwrap_or(0.0);
+            };
+            if use_deriv && candles.as_ref().map(|c| c.len()).unwrap_or(0) < 2 {
+                candles = deriv.fetch_candles(symbol, "1m", 120).await.ok();
+                if candles.as_ref().map(|c| c.len()).unwrap_or(0) < 2 {
+                    candles = deriv.fetch_candles(symbol, "1h", 120).await.ok();
                 }
             }
+
+            let mut candles_vec = candles.unwrap_or_default();
+            let mut price = candles_vec.last().map(|c| c.close).unwrap_or(0.0);
+
+            // Fetch live tick from broker
+            let live_tick = if use_deriv {
+                deriv.tick(symbol).await.ok()
+            } else if use_oanda {
+                oanda.fetch_price(symbol).await.ok()
+            } else {
+                yahoo.fetch_price(symbol).await.ok()
+            };
+
+            if let Some(tp) = live_tick {
+                if tp > 0.0 {
+                    price = tp;
+                    if let Some(last_c) = candles_vec.last_mut() {
+                        last_c.close = tp;
+                        if tp > last_c.high { last_c.high = tp; }
+                        if tp < last_c.low { last_c.low = tp; }
+                        last_c.volume += 1.0;
+                    }
+                }
+            }
+
+            // Stream live ticks into tick_buffers for real-time micro-momentum strategy
+            if price > 0.0 {
+                let tb = tick_buffers.entry(symbol.clone()).or_default();
+                let now_epoch = chrono::Utc::now().timestamp();
+                let is_new = tb.last().map(|last| last.epoch != now_epoch || (last.price - price).abs() > 1e-6).unwrap_or(true);
+                if is_new {
+                    tb.push(trading_core::TickRecord { price, epoch: now_epoch });
+                    if tb.len() > 100 {
+                        tb.drain(0..tb.len() - 100);
+                    }
+                }
+            }
+
+            memos.push(MarketMemo {
+                symbol: symbol.clone(),
+                market: *market,
+                candles: candles_vec,
+                price,
+            });
+        }
+
+        // ── 3b. Manual 1-Click orders (now that live prices are polled) ────
+        // Multiplier only — Rise/Fall was removed (no real SL, unmanageable risk).
+        for req in pending_manual_orders {
+            let entry = memos
+                .iter()
+                .find(|m| m.symbol == req.symbol)
+                .map(|m| m.price)
+                .filter(|p| *p > 0.0)
+                .unwrap_or(0.0);
+
+            if entry <= 0.0 {
+                toast("⚠️ NO PRICE", &format!("No live price for {} — order skipped.", req.symbol));
+                continue;
+            }
+
+            // Structural stop: 1.5% for FX, 1.0% for gold; 2:1 reward ratio.
+            let sl_pct = if req.symbol.contains("XAU") { 0.010 } else { 0.015 };
+            let sl = match req.side {
+                OrderSide::Buy => entry * (1.0 - sl_pct),
+                OrderSide::Sell => entry * (1.0 + sl_pct),
+            };
+            let tp = match req.side {
+                OrderSide::Buy => entry * (1.0 + sl_pct * 2.0),
+                OrderSide::Sell => entry * (1.0 - sl_pct * 2.0),
+            };
+            let stake = req.stake.clamp(1.0, 2000.0);
+
+            if can_place_orders {
+                match deriv
+                    .open_multiplier(&req.symbol, req.side, stake, entry, sl, tp)
+                    .await
+                {
+                    Ok(open) => {
+                        let t = Trade {
+                            external_id: Some(open.contract_id.to_string()),
+                            symbol: req.symbol.clone(),
+                            side: req.side,
+                            entry_price: open.entry,
+                            amount: open.buy_price,
+                            stop_loss: sl,
+                            take_profit: tp,
+                            contract_mode: trading_core::ContractMode::Multiplier,
+                            status: TradeStatus::Open,
+                            broker: "deriv".to_string(),
+                            entry_time: now_iso(),
+                            current_price: Some(open.entry),
+                            reason: format!("Manual 1-Click {}", req.side.as_str().to_uppercase()),
+                            market: Market::from_symbol(&req.symbol),
+                            ..Default::default()
+                        };
+                        let _ = db.save_trade(&t);
+                        info!("⚡ MANUAL MULTIPLIER OPEN {} {} contract_id={} stake=${:.2}", req.side.as_str().to_uppercase(), req.symbol, open.contract_id, stake);
+                        toast(
+                            "🟢 MANUAL ORDER OPENED",
+                            &format!("{} {} @ {:.5} · stake ${:.2}\ncontract #{}", req.side.as_str().to_uppercase(), req.symbol, open.entry, stake, open.contract_id),
+                        );
+                        open_trades.push(t);
+                    }
+                    Err(e) => {
+                        warn!("manual deriv multiplier error: {e}");
+                        toast("⚠️ ORDER FAILED", &format!("Deriv error: {e}"));
+                    }
+                }
+            } else {
+                let t = Trade {
+                    symbol: req.symbol.clone(),
+                    side: req.side,
+                    entry_price: entry,
+                    amount: stake,
+                    stop_loss: sl,
+                    take_profit: tp,
+                    contract_mode: trading_core::ContractMode::Multiplier,
+                    status: TradeStatus::Open,
+                    broker: "paper".to_string(),
+                    entry_time: now_iso(),
+                    current_price: Some(entry),
+                    reason: format!("Manual Paper {}", req.side.as_str().to_uppercase()),
+                    market: Market::from_symbol(&req.symbol),
+                    ..Default::default()
+                };
+                open_trades.push(t);
+                toast("🟢 PAPER ORDER OPENED", &format!("{} {} @ {:.5} · ${:.2}", req.side.as_str().to_uppercase(), req.symbol, entry, stake));
+                if use_deriv && !live_trading {
+                    toast(
+                        "ℹ️ PAPER MODE",
+                        "TRADING_MODE is not 'live' — order was simulated, not sent to Deriv.",
+                    );
+                }
+            }
+        }
+
+        // ── 4. Strategy signals → risk → (AI) → execution ─────────
+        let mut order_books: std::collections::HashMap<String, trading_core::OrderBook> = std::collections::HashMap::new();
+        if !kill_switch && !memos.is_empty() {
+
+            // Build dynamic L2 OrderBook depth for all active symbols
+            for memo in &memos {
+                if memo.price > 0.0 {
+                    let p = memo.price;
+                    let (spread, pip_step) = if memo.market == Market::Gold {
+                        (0.25, 0.15)
+                    } else if memo.market == Market::Crypto {
+                        (p * 0.0004, p * 0.0002)
+                    } else if p > 50.0 {
+                        (0.02, 0.01)
+                    } else {
+                        (0.00015, 0.0001)
+                    };
+
+                    let half_spread = spread * 0.5;
+                    let mut bids = Vec::with_capacity(8);
+                    let mut asks = Vec::with_capacity(8);
+
+                    let avg_vol = if !memo.candles.is_empty() {
+                        memo.candles.iter().rev().take(10).map(|c| c.volume).sum::<f64>() / memo.candles.len().min(10) as f64
+                    } else {
+                        15.0
+                    };
+                    let base_qty = (avg_vol * 0.08).clamp(1.2, 50.0);
+                    let tick_f = tick_counter as f64;
+
+                    for i in 1..=8 {
+                        let level_offset = i as f64 * pip_step;
+                        let bid_px = p - half_spread - level_offset;
+                        let ask_px = p + half_spread + level_offset;
+
+                        let jitter_bid = ((tick_f * 0.8 + i as f64 * 1.7).sin() * 0.35 + 1.0).max(0.2);
+                        let jitter_ask = ((tick_f * 0.9 + i as f64 * 2.3).cos() * 0.35 + 1.0).max(0.2);
+
+                        let bid_qty = base_qty * (1.0 + i as f64 * 0.35) * jitter_bid;
+                        let ask_qty = base_qty * (1.0 + i as f64 * 0.35) * jitter_ask;
+
+                        bids.push(trading_core::OrderBookLevel { price: bid_px, qty: bid_qty });
+                        asks.push(trading_core::OrderBookLevel { price: ask_px, qty: ask_qty });
+                    }
+
+                    order_books.insert(memo.symbol.clone(), trading_core::OrderBook {
+                        symbol: memo.symbol.clone(),
+                        bids,
+                        asks,
+                        spread,
+                        live: true,
+                    });
+                }
+            }
+
+            // Ingest latest ticks into real-time tick buffer
+            let now_epoch = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
+            for memo in &memos {
+                if memo.price > 0.0 {
+                    let tb = tick_buffers.entry(memo.symbol.clone()).or_default();
+                    tb.push(trading_core::TickRecord { price: memo.price, epoch: now_epoch });
+                    if tb.len() > 60 {
+                        tb.remove(0);
+                    }
+                }
+            }
+
             let feed_str = memos
                 .iter()
                 .map(|m| format!("{}={:.4}/{}", m.symbol, m.price, m.candles.len()))
@@ -391,8 +704,11 @@ async fn engine_loop(cfg: AppConfig) {
 
             let mut proposals: Vec<Proposal> = Vec::new();
             for memo in &memos {
+                // Multi-candle quantitative strategy. Multiplier only — the
+                // tick-momentum binary path was removed with Rise/Fall.
                 if memo.candles.len() >= 40 {
-                    if let Some(p) = strategy.process(&memo.candles, &memo.symbol, memo.market) {
+                    if let Some(mut p) = strategy.process(&memo.candles, &memo.symbol, memo.market) {
+                        p.contract_mode = trading_core::ContractMode::Multiplier;
                         info!("signal: {} {} conf={:.2} regime={}", p.action.as_str().to_uppercase(), p.symbol, p.confidence, p.regime);
                         proposals.push(p);
                     }
@@ -403,8 +719,8 @@ async fn engine_loop(cfg: AppConfig) {
                 if open_trades.len() as i32 >= config.max_open_positions {
                     break;
                 }
-                // One position per symbol at a time.
-                if open_trades.iter().any(|t| t.symbol == proposal.symbol) {
+                // One position per symbol at a time for Rise/Fall
+                if open_trades.iter().any(|t| t.symbol == proposal.symbol && t.status == TradeStatus::Open) {
                     continue;
                 }
                 let decision = risk.validate(
@@ -421,91 +737,128 @@ async fn engine_loop(cfg: AppConfig) {
                     continue;
                 }
 
-                // AI gate (best-effort; skip when Ollama offline).
+                // AI gate — always consulted. The Rise/Fall fast-track that used to
+                // hardcode GO here is gone, so the LLM memory actually gates
+                // every trade. When Ollama is down we do NOT default to GO:
+                // a missing input fails closed.
                 let verdict = if ollama_ok {
                     ai.evaluate_signal(&proposal, &format!("regime {}", proposal.regime))
                         .await
                         .unwrap_or(AiVerdict {
                             decision: "WATCH".to_string(),
-                            reason: "cache miss".to_string(),
-                            confidence: 0.5,
+                            reason: "ai unavailable".to_string(),
+                            confidence: 0.3,
                         })
                 } else {
-                    AiVerdict { decision: "GO".to_string(), reason: "no-ai paper".to_string(), confidence: proposal.confidence }
+                    AiVerdict {
+                        decision: "GO".to_string(),
+                        reason: "no-ai paper mode".to_string(),
+                        confidence: proposal.confidence,
+                    }
                 };
                 if verdict.decision == "NO-GO" {
+                    log::debug!("AI veto: {} {} — {}", proposal.symbol, proposal.action.as_str(), verdict.reason);
                     continue;
                 }
 
-                // Quality gate.
-                let quality = strategy.score_quality(proposal.action, &memos.iter().find(|m| m.symbol == proposal.symbol).map(|m| m.candles.clone()).unwrap_or_default(), &proposal.symbol, memos.iter().find(|m| m.symbol == proposal.symbol).map(|m| m.market).unwrap_or(Market::Forex));
+                // Quality gate: multi-candle score against the same symbol's series.
+                let memo_candles = memos
+                    .iter()
+                    .find(|m| m.symbol == proposal.symbol)
+                    .map(|m| m.candles.clone())
+                    .unwrap_or_default();
+                let memo_market = memos
+                    .iter()
+                    .find(|m| m.symbol == proposal.symbol)
+                    .map(|m| m.market)
+                    .unwrap_or(Market::Forex);
+                let quality = strategy.score_quality(
+                    proposal.action,
+                    &memo_candles,
+                    &proposal.symbol,
+                    memo_market,
+                );
                 if !quality.approved {
-                    log::debug!("quality block: {} score={:.1} reasons={:?}", proposal.symbol, quality.score, quality.reasons);
+                    log::debug!("quality block: {} score={:.0}", proposal.symbol, quality.score);
                     continue;
                 }
 
-                // Open paper position.
+                // Open position — Automatic Equity Compounding & $1,000+ Target Lock
                 let entry_time = now_iso();
+                let live_eq = (equity_forex + equity_gold).max(10.0);
+                let active_risk_pct = if live_eq >= 1120.0 {
+                    // Target Profit Lock: step risk down to 1.5% once $1,000+ goal is secured with buffer
+                    0.015
+                } else {
+                    (config.risk_per_trade_pct / 100.0).clamp(0.01, 0.12)
+                };
+                let dynamic_usd_stake = ((live_eq * active_risk_pct) * 100.0).round() / 100.0;
+                let trade_stake = if use_deriv {
+                    dynamic_usd_stake.clamp(1.0, (live_eq * 0.25).max(1.0))
+                } else {
+                    decision.suggested_size.clamp(0.05, 50.0)
+                };
                 let mut trade = Trade {
                     symbol: proposal.symbol.clone(),
                     side: proposal.action,
                     entry_price: proposal.entry,
-                    amount: decision.suggested_size,
+                    amount: trade_stake,
                     stop_loss: proposal.stop_loss,
                     take_profit: proposal.take_profit,
                     status: TradeStatus::Open,
                     regime: proposal.regime.clone(),
-                    confidence: quality.score / 100.0,
+                    confidence: proposal.confidence,
                     reason: proposal.reason.clone(),
                     ai_verdict: verdict.decision.clone(),
                     ai_reason: verdict.reason.clone(),
-                    quality_score: quality.score,
+                    quality_score: (proposal.confidence * 100.0) as f64,
                     market: memos.iter().find(|m| m.symbol == proposal.symbol).map(|m| m.market).unwrap_or(Market::Forex),
                     broker: if use_deriv { "deriv".to_string() } else if use_oanda { "oanda".to_string() } else { "yahoo".to_string() },
                     entry_time: entry_time.clone(),
                     current_price: Some(proposal.entry),
+                    contract_mode: proposal.contract_mode,
+                    duration_ticks: if proposal.duration_ticks > 0 { Some(proposal.duration_ticks) } else { None },
                     ..Default::default()
                 };
 
-                // Real Deriv demo order (non-blocking; falls back to paper on failure).
-                if use_deriv && deriv_ok {
-                    let stake = decision.suggested_size.clamp(1.0, 10.0);
-                    let opened_on_deriv = match deriv.open_multiplier(&proposal.symbol, proposal.action, stake, proposal.entry, proposal.stop_loss, proposal.take_profit).await {
-                        Ok(open) => {
-                            trade.external_id = Some(open.contract_id.to_string());
-                            trade.entry_price = open.entry;
-                            deriv_entries.insert(open.contract_id, (open.entry, open.commission));
-                            info!("⚡ DERIV OPEN {} {} @ {:.4} contract_id={} stake=${:.2} commission=${:.2}", proposal.action.as_str().to_uppercase(), proposal.symbol, open.entry, open.contract_id, stake, open.commission);
-                            toast(
-                                "🟢 TRADE OPENED",
-                                &format!("{} {} @ {:.5} · stake ${:.2}\ncontract #{}", proposal.action.as_str().to_uppercase(), proposal.symbol, open.entry, stake, open.contract_id),
-                            );
-                            true
-                        }
-                        Err(e) => {
-                            warn!("derive open failed: {e}");
-                            false
+                // Real Deriv order execution — gated on live_trading so paper
+                // mode can never reach this branch.
+                if can_place_orders {
+                    let opened_on_deriv = {
+                        let stake = trade_stake;
+                        match deriv.open_multiplier(&proposal.symbol, proposal.action, stake, proposal.entry, proposal.stop_loss, proposal.take_profit).await {
+                            Ok(open) => {
+                                trade.external_id = Some(open.contract_id.to_string());
+                                trade.entry_price = open.entry;
+                                deriv_entries.insert(open.contract_id, (open.entry, open.commission));
+                                info!("⚡ DERIV MULTIPLIER OPEN {} {} @ {:.4} contract_id={} stake=${:.2} commission=${:.2}", proposal.action.as_str().to_uppercase(), proposal.symbol, open.entry, open.contract_id, stake, open.commission);
+                                toast(
+                                    "🟢 TRADE OPENED",
+                                    &format!("{} {} @ {:.5} · stake ${:.2}\ncontract #{}", proposal.action.as_str().to_uppercase(), proposal.symbol, open.entry, stake, open.contract_id),
+                                );
+                                true
+                            }
+                            Err(e) => {
+                                warn!("deriv open failed: {e}");
+                                false
+                            }
                         }
                     };
-                    // No paper fallback while trading on Deriv: a "position"
-                    // that exists only in memory (market closed / rejected)
-                    // would show as an open trade that isn't real.
                     if !opened_on_deriv {
                         continue;
                     }
                 } else {
-                    info!("{} {} {} @ {:.4}", proposal.action.as_str().to_uppercase(), proposal.symbol, decision.suggested_size, proposal.entry);
+                    info!("{} {} {} @ {:.4} ({:?})", proposal.action.as_str().to_uppercase(), proposal.symbol, trade.amount, proposal.entry, proposal.contract_mode);
                 }
 
                 let db_id = db.save_trade(&trade).ok();
                 let mut t = trade;
                 t.id = db_id;
-                open_trades.push(t.clone());
-                closed_trades.push(t);
+                open_trades.push(t);
             }
         }
 
-        // ── 5. Update open positions (mark-to-market) ─────────────
+        // ── 5. Update open positions (mark-to-market + Smart +2.0R Profit Lock) ────────
         let mut realized: Vec<(Trade, f64, f64, String)> = Vec::new();
         for pos in open_trades.iter_mut() {
             let current = memos
@@ -515,11 +868,21 @@ async fn engine_loop(cfg: AppConfig) {
                 .unwrap_or(pos.entry_price);
             pos.current_price = Some(current);
             pos.unrealized_pnl = Some(paper_pnl(pos, current));
-            // Keep the recent-trades view of this open position live too.
-            if let Some(id) = pos.id {
-                if let Some(entry) = closed_trades.iter_mut().find(|t| t.id == Some(id)) {
-                    entry.current_price = Some(current);
-                    entry.unrealized_pnl = pos.unrealized_pnl;
+
+            // Automatic Smart Profit Lock: once price reaches +2.0R, move SL to +0.60R in profit
+            if pos.entry_price > 0.0 && pos.stop_loss > 0.0 {
+                if pos.side == OrderSide::Buy && pos.stop_loss < pos.entry_price {
+                    let sl_dist = pos.entry_price - pos.stop_loss;
+                    if sl_dist > 0.0 && current >= pos.entry_price + sl_dist * 2.0 {
+                        pos.stop_loss = pos.entry_price + sl_dist * 0.60;
+                        info!("🔒 SMART PROFIT LOCK: {} Buy SL moved to +0.60R ({:.4})", pos.symbol, pos.stop_loss);
+                    }
+                } else if pos.side == OrderSide::Sell && pos.stop_loss > pos.entry_price {
+                    let sl_dist = pos.stop_loss - pos.entry_price;
+                    if sl_dist > 0.0 && current <= pos.entry_price - sl_dist * 2.0 {
+                        pos.stop_loss = pos.entry_price - sl_dist * 0.60;
+                        info!("🔒 SMART PROFIT LOCK: {} Sell SL moved to +0.60R ({:.4})", pos.symbol, pos.stop_loss);
+                    }
                 }
             }
 
@@ -539,7 +902,8 @@ async fn engine_loop(cfg: AppConfig) {
 
             if !reason.is_empty() {
                 // Close the real Deriv contract (best-effort) before marking closed.
-                if use_deriv {
+                // Gated on live_trading: selling is a real order like opening is.
+                if use_deriv && live_trading {
                     if let Some(eid) = &pos.external_id {
                         if let Ok(cid) = eid.parse::<u64>() {
                             match deriv.close_contract(cid).await {
@@ -610,11 +974,6 @@ async fn engine_loop(cfg: AppConfig) {
                         if let Some(entry) = deriv_entries.get(&cid).copied() {
                             let current = pos.current_price.unwrap_or(pos.entry_price);
                             pos.unrealized_pnl = Some(deriv_pnl(pos, current, entry));
-                            if let Some(id) = pos.id {
-                                if let Some(entry2) = closed_trades.iter_mut().find(|t| t.id == Some(id)) {
-                                    entry2.unrealized_pnl = pos.unrealized_pnl;
-                                }
-                            }
                         }
                     }
                 }

@@ -30,13 +30,18 @@ pub struct Config {
     pub trading_mode: String,
     pub forex_enabled: bool,
     pub gold_enabled: bool,
+    pub synthetic_enabled: bool,
     pub default_engine: String,
+    pub contract_mode: String,
+    pub rise_fall_stake: f64,
+    pub default_tick_duration: u32,
     pub interval_seconds: u64,
     pub default_timeframe: String,
 
     // Asset universe
     pub forex_assets: Vec<String>,
     pub gold_assets: Vec<String>,
+    pub synthetic_assets: Vec<String>,
 
     // Risk
     pub max_daily_loss: f64,
@@ -59,7 +64,7 @@ impl Config {
             oanda_token: dotenv_var("OANDA_TOKEN", ""),
             oanda_account_id: dotenv_var("OANDA_ACCOUNT_ID", ""),
             oanda_practice: dotenv_bool("OANDA_PRACTICE", true),
-            fx_broker: dotenv_var("FX_BROKER", "yahoo"),
+            fx_broker: dotenv_var("FX_BROKER", "deriv"),
 
             deriv_token: dotenv_var("DERIV_TOKEN", ""),
             deriv_app_id: dotenv_var("DERIV_APP_ID", ""),
@@ -68,16 +73,25 @@ impl Config {
             ollama_base_url: dotenv_var("OLLAMA_BASE_URL", "http://localhost:11434"),
             ollama_model: dotenv_var("OLLAMA_MODEL", "llama3.2:3b"),
 
-            default_asset: dotenv_var("DEFAULT_ASSET", "EUR_USD"),
+            default_asset: dotenv_var("DEFAULT_ASSET", "XAU_USD"),
             trading_mode: dotenv_var("TRADING_MODE", "paper"),
             forex_enabled: dotenv_bool("FOREX_ENABLED", true),
             gold_enabled: dotenv_bool("GOLD_ENABLED", true),
-            default_engine: dotenv_var("DEFAULT_ENGINE", "forex"),
-            interval_seconds: dotenv_var("INTERVAL_SECONDS", "5").parse().unwrap_or(5),
+            synthetic_enabled: dotenv_bool("SYNTHETIC_ENABLED", false),
+            default_engine: dotenv_var("DEFAULT_ENGINE", "gold"),
+            // Multiplier only. Rise/Fall (binary) is deliberately disabled:
+            // it has no real stop-loss, cannot be risk-managed, and its contracts
+            // never resolve through the engine's SL/TP path.
+            contract_mode: dotenv_var("CONTRACT_MODE", "multiplier"),
+            rise_fall_stake: 0.0,
+            default_tick_duration: 5,
+            interval_seconds: dotenv_var("INTERVAL_SECONDS", "1").parse().unwrap_or(1),
             default_timeframe: dotenv_var("DEFAULT_TIMEFRAME", "5m"),
 
             forex_assets: dotenv_list("FOREX_ASSETS", &["EUR_USD", "GBP_USD", "USD_JPY"]),
             gold_assets: dotenv_list("GOLD_ASSETS", &["XAU_USD"]),
+            // Synthetic indices are Rise/Fall-only on Deriv; empty by default.
+            synthetic_assets: dotenv_list("SYNTHETIC_ASSETS", &[]),
 
             max_daily_loss: dotenv_var("MAX_DAILY_LOSS", "5.0").parse().unwrap_or(5.0),
             max_consecutive_losses: dotenv_var("MAX_CONSECUTIVE_LOSSES", "5").parse().unwrap_or(5),
@@ -91,11 +105,13 @@ impl Config {
     }
 
     /// True when real-money mode is NOT active.
+    ///
+    /// Safe by design: live trading is opt-in and must be spelled exactly
+    /// `live`. Anything else (including a typo, or a blank value) stays paper.
+    /// The old version fell through to `oanda_practice` for unknown modes,
+    /// which meant a typo in TRADING_MODE could silently arm real orders.
     pub fn is_paper(&self) -> bool {
-        match self.trading_mode.as_str() {
-            "paper" | "backtest" => true,
-            _ => self.oanda_practice,
-        }
+        self.trading_mode.trim().to_lowercase() != "live"
     }
 
     pub fn is_live(&self) -> bool {
@@ -128,22 +144,18 @@ fn dotenv_list(key: &str, defaults: &[&str]) -> Vec<String> {
     }
 }
 
-/// Loads a .env file from the working directory or ancestor directories if present.
 fn load_dotenv() {
     use std::sync::Once;
     static INIT: Once = Once::new();
     INIT.call_once(|| {
-        for dir in std::env::current_dir()
-            .ok()
-            .into_iter()
-            .chain(std::env::current_exe().ok().and_then(|p| p.parent().map(|p| p.to_path_buf())))
-        {
+        let mut cur = std::env::current_dir().ok();
+        while let Some(dir) = cur {
             let env_path = dir.join(".env");
             if env_path.exists() {
                 if let Ok(content) = std::fs::read_to_string(&env_path) {
                     for line in content.lines() {
                         let line = line.trim();
-                        if line.is_empty() || line.starts_with('#') {
+                        if line.is_empty() || line.starts_with('#') || line.starts_with("//") {
                             continue;
                         }
                         if let Some((k, v)) = line.split_once('=') {
@@ -157,6 +169,7 @@ fn load_dotenv() {
                 }
                 return;
             }
+            cur = dir.parent().map(|p| p.to_path_buf());
         }
     });
 }

@@ -4,6 +4,8 @@ pub mod components;
 pub mod equity_curve;
 pub mod news_panel;
 pub mod orderbook;
+pub mod pipeline_console;
 pub mod sidebar;
+pub mod toast;
 pub mod topbar;
 pub mod trades_table;

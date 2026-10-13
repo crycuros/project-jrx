@@ -6,17 +6,28 @@ use std::collections::HashMap;
 /// Market type discriminator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum Market {
+    Crypto,
     #[default]
     Forex,
     Gold,
+    Synthetic,
 }
 
 impl Market {
     pub fn from_symbol(symbol: &str) -> Self {
-        if symbol == "XAU_USD" || symbol == "XAUUSD" || symbol == "XAU/USD" {
+        let sym_up = symbol.to_uppercase();
+        if sym_up.contains("1HZ") || sym_up.starts_with("R_") || sym_up.contains("VOL") || sym_up.contains("SYNTH") {
+            Market::Synthetic
+        } else if sym_up.contains("XAU") {
             Market::Gold
-        } else if symbol.contains('_') {
-            Market::Forex
+        } else if symbol.contains('/') {
+            let base = symbol.split('/').next().unwrap_or("");
+            let crypto_bases = ["BTC","ETH","SOL","BNB","XRP","ADA","DOT","AVAX","MATIC","LINK","UNI","ATOM"];
+            if crypto_bases.contains(&base) {
+                Market::Crypto
+            } else {
+                Market::Forex
+            }
         } else {
             Market::Forex
         }
@@ -24,15 +35,19 @@ impl Market {
 
     pub fn as_str(&self) -> &'static str {
         match self {
-            Market::Gold => "gold",
-            Market::Forex => "forex",
+            Market::Crypto => "crypto",
+            Market::Gold   => "gold",
+            Market::Forex  => "forex",
+            Market::Synthetic => "synthetic",
         }
     }
 
     pub fn contract_size(&self) -> f64 {
         match self {
-            Market::Forex => 100_000.0,
-            Market::Gold => 100.0,
+            Market::Crypto => 1.0,
+            Market::Forex  => 100_000.0,
+            Market::Gold   => 100.0,
+            Market::Synthetic => 1.0,
         }
     }
 }
@@ -86,6 +101,45 @@ pub enum OrderStatus {
     Rejected,
 }
 
+/// Contract type for execution: Multiplier (standard leveraged position) vs Rise/Fall (binary options).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum ContractMode {
+    #[default]
+    Multiplier,
+    RiseFall,
+}
+
+impl ContractMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ContractMode::Multiplier => "multiplier",
+            ContractMode::RiseFall => "rise_fall",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "rise_fall" | "risefall" | "binary" | "options" => ContractMode::RiseFall,
+            _ => ContractMode::Multiplier,
+        }
+    }
+}
+
+/// A single real-time market tick from live WebSocket stream.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+pub struct TickRecord {
+    pub price: f64,
+    pub epoch: i64,
+}
+
+/// An incoming live tick payload with symbol and timestamp.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LiveTick {
+    pub symbol: String,
+    pub price: f64,
+    pub epoch: i64,
+}
+
 /// An open or closed trade position.
 /// Mirrors `positions` + `trades` in the original DB.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -111,6 +165,12 @@ pub struct Trade {
     pub entry_time: String,
     pub exit_time: Option<String>,
     pub external_id: Option<String>,
+    #[serde(default)]
+    pub contract_mode: ContractMode,
+    #[serde(default)]
+    pub duration_ticks: Option<u32>,
+    #[serde(default)]
+    pub payout: Option<f64>,
     /// unrealized PnL (live tick), not persisted
     #[serde(default)]
     pub unrealized_pnl: Option<f64>,
@@ -142,6 +202,9 @@ impl Default for Trade {
             entry_time: String::new(),
             exit_time: None,
             external_id: None,
+            contract_mode: ContractMode::Multiplier,
+            duration_ticks: None,
+            payout: None,
             unrealized_pnl: None,
             current_price: None,
         }
@@ -419,6 +482,39 @@ pub struct AiVerdict {
     pub confidence: f64,
 }
 
+/// Market regime — classified from price structure before strategy signals run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum Regime {
+    /// Strong directional trend (ADX > 25, EMA spread wide)
+    #[default]
+    Trending,
+    /// Sideways / mean-reverting (ADX < 20, price oscillates)
+    Ranging,
+    /// Elevated volatility, wide ATR% — caution zone
+    Volatile,
+    /// Price breaking out of consolidation range
+    Breakout,
+}
+
+impl Regime {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Regime::Trending  => "trending",
+            Regime::Ranging   => "ranging",
+            Regime::Volatile  => "volatile",
+            Regime::Breakout  => "breakout",
+        }
+    }
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "ranging"   => Regime::Ranging,
+            "volatile"  => Regime::Volatile,
+            "breakout"  => Regime::Breakout,
+            _           => Regime::Trending,
+        }
+    }
+}
+
 /// Strategy signal proposal.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Proposal {
@@ -431,6 +527,14 @@ pub struct Proposal {
     pub confidence: f64,
     pub regime: String,
     pub reason: String,
+    /// Which sub-strategy produced this signal (e.g. "trend::ema_cross", "mean_rev::bb_touch", "tick::momentum")
+    pub strategy_source: String,
+    /// Number of strategies that agreed on this signal (for voting combiner)
+    pub vote_count: u8,
+    /// Execution contract mode (Multiplier vs Rise/Fall)
+    pub contract_mode: ContractMode,
+    /// Contract duration in ticks for Rise/Fall binary options
+    pub duration_ticks: u32,
 }
 
 // Convenience alias for JSON maps used by UI snapshots.
