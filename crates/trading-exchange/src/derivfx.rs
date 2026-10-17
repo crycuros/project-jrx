@@ -25,9 +25,13 @@ use trading_core::{Candle, Config, Instrument, Market, Order, OrderSide, OrderSt
 use super::Exchange;
 
 const MULTIPLIER: u32 = 100;
-const TF_SECS: Duration = Duration::from_secs(2);
+const TF_SECS: Duration = Duration::from_secs(15);
 
 type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+fn as_num(v: &Value) -> Option<f64> {
+    v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()))
+}
 
 fn deriv_symbol(symbol: &str) -> String {
     match symbol {
@@ -157,18 +161,21 @@ pub struct OpenMult {
 }
 
 pub struct DerivFx {
-    #[allow(dead_code)]
     http: Http,
     token: String,
     app_id: String,
-    #[allow(dead_code)]
-    account_id: String,
+    account_id: Arc<Mutex<String>>,
+    // Persistent reusable WebSocket connection so we don't spam /otp 20x/sec
+    ws_conn: Arc<tokio::sync::Mutex<Option<Ws>>>,
     // live tick prices per symbol (quote), refreshed by continuous tick stream
     tick_cache: Arc<Mutex<HashMap<String, f64>>>,
     // candles cache: symbol:tf -> (fetched_at, candles)
     candle_cache: Arc<Mutex<HashMap<String, (SystemTime, Vec<Candle>)>>>,
     // last known free balance, refreshed by free_balance()
-    balance_cache: Mutex<Option<f64>>,
+    balance_cache: Mutex<Option<(SystemTime, f64)>>,
+    // portfolio & profit_table caches to avoid redundant round-trips every 500ms
+    portfolio_cache: Mutex<Option<(SystemTime, Vec<DerivContract>)>>,
+    profit_table_cache: Mutex<Option<(SystemTime, Vec<ClosedContract>)>>,
     // statement(500) is heavy (one WS round-trip + 500 rows). Cached for
     // STATEMENT_TTL so the engine loop isn't pulling it twice a second.
     statement_cache: Mutex<Option<(SystemTime, Vec<StatementTx>)>>,
@@ -183,16 +190,90 @@ impl DerivFx {
                 .expect("build reqwest"),
             token: cfg.deriv_token.clone(),
             app_id: cfg.deriv_app_id.clone(),
-            account_id: cfg.deriv_account_id.clone(),
+            account_id: Arc::new(Mutex::new(cfg.deriv_account_id.clone())),
+            ws_conn: Arc::new(tokio::sync::Mutex::new(None)),
             tick_cache: Arc::new(Mutex::new(HashMap::new())),
             candle_cache: Arc::new(Mutex::new(HashMap::new())),
             balance_cache: Mutex::new(None),
+            portfolio_cache: Mutex::new(None),
+            profit_table_cache: Mutex::new(None),
             statement_cache: Mutex::new(None),
         }
     }
 
     pub fn is_configured(&self) -> bool {
         !self.token.is_empty()
+    }
+
+    /// Fetch an authenticated OTP WebSocket URL (auto-updating account_id if the configured one fails).
+    async fn otp_url_static(
+        http: &Http,
+        token: &str,
+        app_id: &str,
+        account_id_lock: &Arc<Mutex<String>>,
+    ) -> Result<String> {
+        if token.is_empty() {
+            bail!("deriv: token missing for otp");
+        }
+        let mut acc_id = account_id_lock.lock().unwrap().clone();
+        if acc_id.is_empty() {
+            let accounts_url = "https://api.derivws.com/trading/v1/options/accounts";
+            if let Ok(resp) = http.get(accounts_url).bearer_auth(token).header("Deriv-App-ID", app_id).send().await {
+                if let Ok(v) = resp.json::<Value>().await {
+                    if let Some(id) = v["data"][0]["account_id"].as_str() {
+                        acc_id = id.to_string();
+                        *account_id_lock.lock().unwrap() = acc_id.clone();
+                    }
+                }
+            }
+        }
+        if acc_id.is_empty() {
+            bail!("deriv: account_id missing and could not be auto-discovered");
+        }
+
+        let url = format!("https://api.derivws.com/trading/v1/options/accounts/{acc_id}/otp");
+        let resp = http
+            .post(&url)
+            .bearer_auth(token)
+            .header("Deriv-App-ID", app_id)
+            .send()
+            .await
+            .map_err(|e| anyhow!("deriv otp request: {e}"))?;
+
+        if !resp.status().is_success() {
+            // Try discovering the real account_id from /options/accounts in case .env had a stale ID
+            let accounts_url = "https://api.derivws.com/trading/v1/options/accounts";
+            if let Ok(acc_resp) = http.get(accounts_url).bearer_auth(token).header("Deriv-App-ID", app_id).send().await {
+                if let Ok(v) = acc_resp.json::<Value>().await {
+                    if let Some(real_id) = v["data"][0]["account_id"].as_str() {
+                        if real_id != acc_id {
+                            log::info!("deriv: updated account_id from {} to {}", acc_id, real_id);
+                            *account_id_lock.lock().unwrap() = real_id.to_string();
+                            let retry_url = format!("https://api.derivws.com/trading/v1/options/accounts/{real_id}/otp");
+                            let retry_resp = http
+                                .post(&retry_url)
+                                .bearer_auth(token)
+                                .header("Deriv-App-ID", app_id)
+                                .send()
+                                .await?
+                                .error_for_status()?;
+                            let rv: Value = retry_resp.json().await?;
+                            return rv["data"]["url"]
+                                .as_str()
+                                .map(|s| s.to_string())
+                                .ok_or_else(|| anyhow!("deriv otp: no ws url in retry response: {rv}"));
+                        }
+                    }
+                }
+            }
+            bail!("deriv otp HTTP status {}", resp.status());
+        }
+
+        let v: Value = resp.json().await?;
+        v["data"]["url"]
+            .as_str()
+            .map(|s| s.to_string())
+            .ok_or_else(|| anyhow!("deriv otp: no ws url in response: {v}"))
     }
 
     /// Spawns a dedicated background task that connects to Deriv WebSocket
@@ -202,18 +283,24 @@ impl DerivFx {
         symbols: Vec<String>,
         tx: Option<tokio::sync::mpsc::UnboundedSender<trading_core::LiveTick>>,
     ) -> tokio::task::JoinHandle<()> {
-        let app_id = if !self.app_id.is_empty() && self.app_id.chars().all(|c| c.is_ascii_digit()) {
-            self.app_id.clone()
-        } else {
-            "1089".to_string()
-        };
+        let http = self.http.clone();
+        let token = self.token.clone();
+        let app_id = self.app_id.clone();
+        let account_id = Arc::clone(&self.account_id);
         let tick_cache = Arc::clone(&self.tick_cache);
         let candle_cache = Arc::clone(&self.candle_cache);
 
         tokio::spawn(async move {
-            let ws_url = format!("wss://ws.derivws.com/websockets/v3?app_id={app_id}");
             loop {
-                log::info!("⚡ Connecting Deriv continuous tick stream to {ws_url}...");
+                let ws_url = match Self::otp_url_static(&http, &token, &app_id, &account_id).await {
+                    Ok(u) => u,
+                    Err(e) => {
+                        log::warn!("Deriv tick stream OTP error: {e}");
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                        continue;
+                    }
+                };
+                log::info!("⚡ Connecting Deriv continuous tick stream via OTP WS...");
                 match connect_async(&ws_url).await {
                     Ok((mut ws, _)) => {
                         log::info!("🟢 Connected to Deriv continuous tick stream for {:?}", symbols);
@@ -233,7 +320,7 @@ impl DerivFx {
                                             let tick_obj = &v["tick"];
                                             let raw_sym = tick_obj["symbol"].as_str().unwrap_or_default();
                                             let sym = from_deriv_symbol(raw_sym);
-                                            let price = tick_obj["quote"].as_f64().or_else(|| tick_obj["ask"].as_f64()).unwrap_or(0.0);
+                                            let price = as_num(&tick_obj["quote"]).or_else(|| as_num(&tick_obj["ask"])).unwrap_or(0.0);
                                             let epoch = tick_obj["epoch"].as_i64().unwrap_or_else(|| chrono::Utc::now().timestamp());
 
                                             if price > 0.0 {
@@ -286,45 +373,27 @@ impl DerivFx {
                         log::warn!("Deriv tick stream connect error: {e}");
                     }
                 }
-                tokio::time::sleep(Duration::from_secs(2)).await;
+                tokio::time::sleep(Duration::from_secs(5)).await;
             }
         })
     }
 
     /// POST /accounts/{id}/otp → authenticated Deriv Options WS url for PAT tokens.
     async fn otp_url(&self) -> Result<String> {
-        if self.account_id.is_empty() || self.token.is_empty() {
-            bail!("deriv: account_id or token missing for otp");
-        }
-        let url = format!("https://api.derivws.com/trading/v1/options/accounts/{}/otp", self.account_id);
-        let resp = self
-            .http
-            .post(&url)
-            .bearer_auth(&self.token)
-            .header("Deriv-App-ID", &self.app_id)
-            .send()
-            .await
-            .map_err(|e| anyhow!("deriv otp request: {e}"))?
-            .error_for_status()
-            .map_err(|e| anyhow!("deriv otp status: {e}"))?;
-        let v: Value = resp.json().await?;
-        v["data"]["url"]
-            .as_str()
-            .map(|s| s.to_string())
-            .ok_or_else(|| anyhow!("deriv otp: no ws url in response: {v}"))
+        Self::otp_url_static(&self.http, &self.token, &self.app_id, &self.account_id).await
     }
 
     async fn connect(&self) -> Result<Ws> {
-        // Mode 1: If using a Deriv Personal Access Token (pat_...) with account_id
-        if self.token.starts_with("pat_") && !self.account_id.is_empty() {
-            if let Ok(otp_ws_url) = self.otp_url().await {
-                if let Ok((ws, _)) = connect_async(&otp_ws_url).await {
-                    return Ok(ws);
-                }
-            }
+        // Mode 1: If using a Deriv Personal Access Token (pat_...)
+        if self.token.starts_with("pat_") {
+            let otp_ws_url = self.otp_url().await?;
+            let (ws, _) = connect_async(&otp_ws_url)
+                .await
+                .map_err(|e| anyhow!("deriv otp ws connect: {e}"))?;
+            return Ok(ws);
         }
 
-        // Mode 2: Standard Deriv WebSocket v3 connection (app_id=1089)
+        // Mode 2: Standard Deriv WebSocket v3 connection
         let app_id = if !self.app_id.is_empty() && self.app_id.chars().all(|c| c.is_ascii_digit()) {
             &self.app_id
         } else {
@@ -342,8 +411,8 @@ impl DerivFx {
             });
             match Self::request(&mut ws, auth_req).await {
                 Ok(auth_resp) => {
-                    if let Some(bal) = auth_resp["authorize"]["balance"].as_f64() {
-                        *self.balance_cache.lock().unwrap() = Some(bal);
+                    if let Some(bal) = as_num(&auth_resp["authorize"]["balance"]) {
+                        *self.balance_cache.lock().unwrap() = Some((SystemTime::now(), bal));
                     }
                 }
                 Err(e) => {
@@ -354,11 +423,36 @@ impl DerivFx {
         Ok(ws)
     }
 
+    /// Execute a request over the shared persistent WebSocket connection,
+    /// automatically reconnecting once if the socket was closed or stale.
+    async fn send_req(&self, req: Value) -> Result<Value> {
+        let mut guard = self.ws_conn.lock().await;
+        if guard.is_none() {
+            *guard = Some(self.connect().await?);
+        }
+        let ws = guard.as_mut().unwrap();
+        match Self::request(ws, req.clone()).await {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                let msg = e.to_string();
+                // If it's a logical Deriv error (like MarketIsClosed), keep the socket alive!
+                if msg.starts_with("deriv ") && !msg.contains("ws send") && !msg.contains("ws recv") && !msg.contains("ws closed") && !msg.contains("timed out") {
+                    return Err(e);
+                }
+                // Socket error — reconnect once and retry
+                log::debug!("Deriv WS reconnecting after socket error: {e}");
+                *guard = None;
+                let mut new_ws = self.connect().await?;
+                let res = Self::request(&mut new_ws, req).await;
+                if res.is_ok() {
+                    *guard = Some(new_ws);
+                }
+                res
+            }
+        }
+    }
+
     /// Send a request, return the response matching its req_id.
-    ///
-    /// Bounded by `REQUEST_TIMEOUT`. A closed or silent socket must fail with an
-    /// error instead of re-entering `ws.next()` on a stream that is already done
-    /// (which returned `None` immediately and spun this loop at 100% CPU).
     async fn request(ws: &mut Ws, req: Value) -> Result<Value> {
         const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -379,7 +473,10 @@ impl DerivFx {
                             return Ok(v);
                         }
                     }
-                    // Ping/Close/other frames: keep reading.
+                    Some(Ok(Message::Ping(p))) => {
+                        let _ = ws.send(Message::Pong(p)).await;
+                    }
+                    // Other frames: keep reading.
                     Some(Ok(_)) => {}
                     Some(Err(e)) => return Err(anyhow!("deriv ws recv: {e}")),
                     None => return Err(anyhow!("deriv ws closed awaiting req_id {req_id}")),
@@ -426,7 +523,6 @@ impl DerivFx {
         sl_price: f64,
         tp_price: f64,
     ) -> Result<OpenMult> {
-        let mut ws = self.connect().await?;
         let ct = match side {
             OrderSide::Buy => "MULTUP",
             OrderSide::Sell => "MULTDOWN",
@@ -448,24 +544,26 @@ impl DerivFx {
             "limit_order": limit,
             "req_id": 1,
         });
-        let r = Self::request(&mut ws, prop).await?;
+        let r = self.send_req(prop).await?;
         let pid = r["proposal"]["id"]
             .as_str()
             .ok_or_else(|| anyhow!("deriv: no proposal id: {r}"))?
             .to_string();
-        let ask = r["proposal"]["ask_price"].as_f64().unwrap_or(stake);
-        let prop_entry = r["proposal"]["spot"].as_f64().unwrap_or(entry);
-        let commission = r["proposal"]["commission"].as_f64().unwrap_or(0.0);
+        let ask = as_num(&r["proposal"]["ask_price"]).unwrap_or(stake);
+        let prop_entry = as_num(&r["proposal"]["spot"]).unwrap_or(entry);
+        let commission = as_num(&r["proposal"]["commission"]).unwrap_or(0.0);
 
         let buy = json!({"buy": pid, "price": ask, "req_id": 2});
-        let rb = Self::request(&mut ws, buy).await?;
+        let rb = self.send_req(buy).await?;
         let contract_id = rb["buy"]["contract_id"]
             .as_u64()
             .ok_or_else(|| anyhow!("deriv: no contract_id: {rb}"))?;
-        let balance_after = rb["buy"]["balance_after"].as_f64().unwrap_or(0.0);
+        let balance_after = as_num(&rb["buy"]["balance_after"]).unwrap_or(0.0);
+        // Invalidate portfolio cache on new trade
+        *self.portfolio_cache.lock().unwrap() = None;
         Ok(OpenMult {
             contract_id,
-            buy_price: rb["buy"]["buy_price"].as_f64().unwrap_or(ask),
+            buy_price: as_num(&rb["buy"]["buy_price"]).unwrap_or(ask),
             entry: prop_entry,
             commission,
             balance_after,
@@ -474,58 +572,66 @@ impl DerivFx {
 
     /// Market-close a Deriv contract (sell at best). Returns the sold-for amount.
     pub async fn close_contract(&self, contract_id: u64) -> Result<f64> {
-        let mut ws = self.connect().await?;
-        let r = Self::request(&mut ws, json!({"sell": contract_id, "price": 0, "req_id": 3})).await?;
-        let sold = r["sell"]["sold_for"]
-            .as_f64()
+        let r = self.send_req(json!({"sell": contract_id, "price": 0, "req_id": 3})).await?;
+        let sold = as_num(&r["sell"]["sold_for"])
             .ok_or_else(|| anyhow!("deriv: no sold_for: {r}"))?;
-        if let Some(b) = r["sell"]["balance_after"].as_f64() {
-            *self.balance_cache.lock().unwrap() = Some(b);
+        if let Some(b) = as_num(&r["sell"]["balance_after"]) {
+            *self.balance_cache.lock().unwrap() = Some((SystemTime::now(), b));
         }
+        *self.portfolio_cache.lock().unwrap() = None;
+        *self.profit_table_cache.lock().unwrap() = None;
         Ok(sold)
     }
 
     /// Query current open-contract snapshot (spot, bid, profit).
     pub async fn open_contract_info(&self, contract_id: u64) -> Result<Value> {
-        let mut ws = self.connect().await?;
-        let r = Self::request(&mut ws, json!({"proposal_open_contract": 1, "contract_id": contract_id, "req_id": 4})).await?;
+        let r = self.send_req(json!({"proposal_open_contract": 1, "contract_id": contract_id, "req_id": 4})).await?;
         Ok(r["proposal_open_contract"].clone())
     }
 
-    /// Real free balance from Deriv WS or REST.
+    /// Real free balance from Deriv WS or REST (cached for 5s).
     pub async fn balance(&self) -> Result<f64> {
-        if self.token.starts_with("pat_") && !self.account_id.is_empty() {
+        const BALANCE_TTL: Duration = Duration::from_secs(5);
+        if let Some((t, b)) = *self.balance_cache.lock().unwrap() {
+            if t.elapsed().unwrap_or(Duration::MAX) < BALANCE_TTL {
+                return Ok(b);
+            }
+        }
+
+        if self.token.starts_with("pat_") {
             let url = "https://api.derivws.com/trading/v1/options/accounts";
             if let Ok(resp) = self.http.get(url).bearer_auth(&self.token).header("Deriv-App-ID", &self.app_id).send().await {
                 if let Ok(v) = resp.json::<Value>().await {
-                    if let Some(bal_str) = v["data"][0]["balance"].as_str() {
-                        if let Ok(bal) = bal_str.parse::<f64>() {
-                            *self.balance_cache.lock().unwrap() = Some(bal);
-                            return Ok(bal);
+                    if let Some(id) = v["data"][0]["account_id"].as_str() {
+                        let mut acc_guard = self.account_id.lock().unwrap();
+                        if acc_guard.is_empty() {
+                            *acc_guard = id.to_string();
                         }
-                    } else if let Some(bal) = v["data"][0]["balance"].as_f64() {
-                        *self.balance_cache.lock().unwrap() = Some(bal);
+                    }
+                    if let Some(bal) = as_num(&v["data"][0]["balance"]) {
+                        *self.balance_cache.lock().unwrap() = Some((SystemTime::now(), bal));
                         return Ok(bal);
                     }
                 }
             }
         }
 
-        if let Some(b) = *self.balance_cache.lock().unwrap() {
-            return Ok(b);
-        }
-
-        let mut ws = self.connect().await?;
-        let r = Self::request(&mut ws, json!({"balance": 1, "req_id": 9998})).await?;
-        let bal = r["balance"]["balance"].as_f64().ok_or_else(|| anyhow!("deriv: no balance in response: {r}"))?;
-        *self.balance_cache.lock().unwrap() = Some(bal);
+        let r = self.send_req(json!({"balance": 1, "req_id": 9998})).await?;
+        let bal = as_num(&r["balance"]["balance"]).ok_or_else(|| anyhow!("deriv: no balance in response: {r}"))?;
+        *self.balance_cache.lock().unwrap() = Some((SystemTime::now(), bal));
         Ok(bal)
     }
 
-    /// Open contracts currently on the Deriv account.
+    /// Open contracts currently on the Deriv account (cached for 5s).
     pub async fn portfolio(&self) -> Result<Vec<DerivContract>> {
-        let mut ws = self.connect().await?;
-        let r = Self::request(&mut ws, json!({"portfolio": 1, "req_id": 7})).await?;
+        const PORTFOLIO_TTL: Duration = Duration::from_secs(5);
+        if let Some((t, v)) = self.portfolio_cache.lock().unwrap().as_ref() {
+            if t.elapsed().unwrap_or(Duration::MAX) < PORTFOLIO_TTL {
+                return Ok(v.clone());
+            }
+        }
+
+        let r = self.send_req(json!({"portfolio": 1, "req_id": 7})).await?;
         let mut out = Vec::new();
         if let Some(arr) = r["portfolio"]["contracts"].as_array() {
             for c in arr {
@@ -533,26 +639,25 @@ impl DerivFx {
                     out.push(DerivContract {
                         contract_id: cid,
                         contract_type: c["contract_type"].as_str().unwrap_or_default().to_string(),
-                        stake: c["buy_price"].as_f64().unwrap_or(0.0),
+                        stake: as_num(&c["buy_price"]).unwrap_or(0.0),
                         underlying: from_deriv_symbol(c["underlying_symbol"].as_str().unwrap_or_default()),
                         purchase_time: c["purchase_time"].as_i64().unwrap_or(0),
                     });
                 }
             }
         }
+        *self.portfolio_cache.lock().unwrap() = Some((SystemTime::now(), out.clone()));
         Ok(out)
     }
 
     /// Full snapshot of a single open contract.
     pub async fn contract_info(&self, contract_id: u64) -> Result<ContractInfo> {
-        let mut ws = self.connect().await?;
-        let r = Self::request(
-            &mut ws,
+        let r = self.send_req(
             json!({"proposal_open_contract": 1, "contract_id": contract_id, "req_id": 8}),
         )
         .await?;
         let p = &r["proposal_open_contract"];
-        let f = |k: &str| p[k].as_str().and_then(|s| s.parse::<f64>().ok()).or_else(|| p[k].as_f64()).unwrap_or(0.0);
+        let f = |k: &str| as_num(&p[k]).unwrap_or(0.0);
         Ok(ContractInfo {
             contract_id,
             entry_spot: f("entry_spot"),
@@ -564,11 +669,16 @@ impl DerivFx {
         })
     }
 
-    /// Recently closed contracts with buy/sell prices.
+    /// Recently closed contracts with buy/sell prices (cached for 10s).
     pub async fn profit_table(&self, limit: u32) -> Result<Vec<ClosedContract>> {
-        let mut ws = self.connect().await?;
-        let r = Self::request(
-            &mut ws,
+        const PROFIT_TABLE_TTL: Duration = Duration::from_secs(10);
+        if let Some((t, v)) = self.profit_table_cache.lock().unwrap().as_ref() {
+            if t.elapsed().unwrap_or(Duration::MAX) < PROFIT_TABLE_TTL {
+                return Ok(v.clone());
+            }
+        }
+
+        let r = self.send_req(
             json!({"profit_table": 1, "limit": limit.clamp(1, 100), "offset": 0, "description": 1, "req_id": 9}),
         )
         .await?;
@@ -580,13 +690,14 @@ impl DerivFx {
                         contract_id: cid,
                         contract_type: c["contract_type"].as_str().unwrap_or_default().to_string(),
                         underlying: from_deriv_symbol(c["underlying_symbol"].as_str().unwrap_or_default()),
-                        buy_price: c["buy_price"].as_f64().unwrap_or(0.0),
-                        sell_price: c["sell_price"].as_f64().unwrap_or(0.0),
+                        buy_price: as_num(&c["buy_price"]).unwrap_or(0.0),
+                        sell_price: as_num(&c["sell_price"]).unwrap_or(0.0),
                         sell_time: c["sell_time"].as_i64().unwrap_or(0),
                     });
                 }
             }
         }
+        *self.profit_table_cache.lock().unwrap() = Some((SystemTime::now(), out.clone()));
         Ok(out)
     }
 
@@ -596,7 +707,7 @@ impl DerivFx {
     /// Served from a short-lived cache: the engine loop needs this every tick
     /// to compute NET PROFIT, and each miss is a full WS round-trip.
     pub async fn statement(&self, limit: u32) -> Result<Vec<StatementTx>> {
-        const STATEMENT_TTL: Duration = Duration::from_secs(10);
+        const STATEMENT_TTL: Duration = Duration::from_secs(15);
 
         if let Some((t, v)) = self.statement_cache.lock().unwrap().as_ref() {
             if t.elapsed().unwrap_or(Duration::MAX) < STATEMENT_TTL {
@@ -604,9 +715,7 @@ impl DerivFx {
             }
         }
 
-        let mut ws = self.connect().await?;
-        let r = Self::request(
-            &mut ws,
+        let r = self.send_req(
             json!({"statement": 1, "limit": limit.clamp(1, 500), "offset": 0, "description": 1, "req_id": 11}),
         )
         .await?;
@@ -620,8 +729,8 @@ impl DerivFx {
                     contract_id: cid,
                     contract_type: t["contract_type"].as_str().unwrap_or_default().to_string(),
                     underlying: from_deriv_symbol(t["underlying_symbol"].as_str().unwrap_or_default()),
-                    amount: t["amount"].as_f64().unwrap_or(0.0),
-                    balance_after: t["balance_after"].as_f64().unwrap_or(0.0),
+                    amount: as_num(&t["amount"]).unwrap_or(0.0),
+                    balance_after: as_num(&t["balance_after"]).unwrap_or(0.0),
                     transaction_time: t["transaction_time"].as_i64().unwrap_or(0),
                     reference_id: t["reference_id"].as_u64().unwrap_or(0),
                 });
@@ -650,12 +759,6 @@ impl DerivFx {
     }
 
     /// Latest live tick (quote) for a symbol.
-    ///
-    /// Prefers the `tick_cache` populated by the persistent stream spawned in
-    /// `spawn_tick_stream`. The engine loop called this every tick for every
-    /// symbol, and each call used to open a fresh WSS connection — ~24 TLS
-    /// handshakes per second. A fresh single-tick query is only issued when no
-    /// streamed tick has arrived within `TICK_MAX_STALE`.
     pub async fn tick(&self, symbol: &str) -> Result<f64> {
         const TICK_MAX_STALE: Duration = Duration::from_secs(5);
 
@@ -672,11 +775,9 @@ impl DerivFx {
             }
         }
 
-        let mut ws = self.connect().await?;
-        let r = Self::request(&mut ws, json!({"ticks": deriv_symbol(symbol), "req_id": 10})).await?;
-        let q = r["tick"]["quote"]
-            .as_f64()
-            .or_else(|| r["tick"]["ask"].as_f64())
+        let r = self.send_req(json!({"ticks": deriv_symbol(symbol), "req_id": 10})).await?;
+        let q = as_num(&r["tick"]["quote"])
+            .or_else(|| as_num(&r["tick"]["ask"]))
             .ok_or_else(|| anyhow!("deriv: no tick quote: {r}"))?;
         {
             let mut cache = self.tick_cache.lock().unwrap();
@@ -702,10 +803,8 @@ impl DerivFx {
 
     // ── Deriv-ful price/candle data (replaces Yahoo) ───────────────────
     async fn fetch_candles_from_deriv(&self, symbol: &str, timeframe: &str, limit: u32) -> Result<Vec<Candle>> {
-        let mut ws = self.connect().await?;
         let sym = deriv_symbol(symbol);
-        let r = Self::request(
-            &mut ws,
+        let r = self.send_req(
             json!({
                 "ticks_history": sym,
                 "granularity": granularity(timeframe),
@@ -723,10 +822,10 @@ impl DerivFx {
                 .filter_map(|c| {
                     Some(Candle {
                         time: c["epoch"].as_i64()? * 1000,
-                        open: c["open"].as_f64()?,
-                        high: c["high"].as_f64()?,
-                        low: c["low"].as_f64()?,
-                        close: c["close"].as_f64()?,
+                        open: as_num(&c["open"])?,
+                        high: as_num(&c["high"])?,
+                        low: as_num(&c["low"])?,
+                        close: as_num(&c["close"])?,
                         volume: 10.0,
                     })
                 })
@@ -741,7 +840,7 @@ impl DerivFx {
             if let (Some(prices), Some(times)) = (history["prices"].as_array(), history["times"].as_array()) {
                 let mut out = Vec::new();
                 for (p, t) in prices.iter().zip(times.iter()) {
-                    if let (Some(px), Some(epoch)) = (p.as_f64(), t.as_i64()) {
+                    if let (Some(px), Some(epoch)) = (as_num(p), t.as_i64()) {
                         out.push(Candle {
                             time: epoch * 1000,
                             open: px,
@@ -763,9 +862,7 @@ impl DerivFx {
 
     /// Fetch real tick history from Deriv for high-frequency microstructure strategy.
     pub async fn fetch_ticks(&self, symbol: &str, count: u32) -> Result<Vec<trading_core::TickRecord>> {
-        let mut ws = self.connect().await?;
-        let r = Self::request(
-            &mut ws,
+        let r = self.send_req(
             json!({
                 "ticks_history": deriv_symbol(symbol),
                 "count": count.clamp(10, 500),
@@ -779,7 +876,7 @@ impl DerivFx {
         if let Some(history) = r.get("history") {
             if let (Some(prices), Some(times)) = (history["prices"].as_array(), history["times"].as_array()) {
                 for (p, t) in prices.iter().zip(times.iter()) {
-                    if let (Some(price), Some(epoch)) = (p.as_f64(), t.as_i64()) {
+                    if let (Some(price), Some(epoch)) = (as_num(p), t.as_i64()) {
                         out.push(trading_core::TickRecord { price, epoch });
                     }
                 }

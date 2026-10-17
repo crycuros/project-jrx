@@ -1,7 +1,5 @@
 #!/bin/bash
-# ==============================================================================
 # JRX AI 1.0 — Ubuntu EC2 Setup & 24/7 Service Deployer
-# ==============================================================================
 set -e
 
 echo "=== 1. Updating packages and installing prerequisites ==="

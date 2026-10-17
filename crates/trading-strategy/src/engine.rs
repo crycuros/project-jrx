@@ -160,20 +160,29 @@ impl StrategyEngine {
                 score += 10.0;
                 reasons.push("regime match".to_string());
             }
-            (OrderSide::Sell, Regime::Ranging | Regime::Volatile) => {
-                score += 8.0;
+            (OrderSide::Sell, Regime::Trending | Regime::Breakout) => {
+                score += 10.0;
                 reasons.push("regime match".to_string());
             }
-            _ => {}
+            (OrderSide::Buy | OrderSide::Sell, Regime::Ranging | Regime::Volatile) => {
+                score += 10.0;
+                reasons.push("regime match".to_string());
+            }
         }
 
-        // Volatility sanity (ATR% bounds)
+        // Mean-reversion RSI extremes should also be rewarded in Ranging markets
+        if regime == Regime::Ranging && !(35.0..=65.0).contains(&r) {
+            score += 10.0;
+            reasons.push("ranging extreme rsi".to_string());
+        }
+
+        // Volatility sanity (ATR% bounds — 5m Forex ATR/price is typically ~0.00008..0.01)
         let last = closes[n - 1];
         let highs: Vec<f64> = candles.iter().map(|c| c.high).collect();
         let lows:  Vec<f64> = candles.iter().map(|c| c.low).collect();
         let atr_val = atr(&highs, &lows, &closes, 14)[n - 1].unwrap_or(0.0);
         let atr_pct = if last > 0.0 { atr_val / last } else { 0.0 };
-        if !(0.0005..0.08).contains(&atr_pct) {
+        if !(0.00004..0.08).contains(&atr_pct) {
             score -= 15.0;
             reasons.push("volatility out of range".to_string());
         }

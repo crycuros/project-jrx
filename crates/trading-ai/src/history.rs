@@ -90,6 +90,25 @@ impl MarketMemory {
                 Err(e) => warn!("market memory cache invalid: {e}"),
             }
         }
+
+        // 2) If pre-mined strategy JSON exists (e.g., on EC2 server where raw parquet/cache are gitignored), load it directly!
+        if Path::new(&strat_path).exists() {
+            if let Ok(strategy) = Self::load_strategy(Path::new(&strat_path)) {
+                let m = Self {
+                    daily: HashMap::new(),
+                    strategy,
+                };
+                info!(
+                    "market memory: loaded pre-mined strategy ({} symbols / {} bars / {} patterns) from {}",
+                    m.strategy.len(),
+                    m.total_bars(),
+                    m.total_patterns(),
+                    strat_path.display()
+                );
+                return m;
+            }
+        }
+
         let mut m = match Self::build(Path::new(&csv_dir), Path::new(&cache)) {
             Ok(m) => m,
             Err(e) => {
@@ -185,11 +204,20 @@ impl MarketMemory {
     }
 
     pub fn len_for(&self, symbol: &str) -> usize {
-        self.daily.get(&map_symbol(symbol)).map(|v| v.len()).unwrap_or(0)
+        let sym = map_symbol(symbol);
+        self.daily
+            .get(&sym)
+            .map(|v| v.len())
+            .or_else(|| self.strategy.get(&sym).map(|s| s.bars))
+            .unwrap_or(0)
     }
 
     pub fn total_bars(&self) -> usize {
-        self.daily.values().map(|v| v.len()).sum()
+        if !self.daily.is_empty() {
+            self.daily.values().map(|v| v.len()).sum()
+        } else {
+            self.strategy.values().map(|s| s.bars).sum()
+        }
     }
 
     pub fn total_patterns(&self) -> usize {
@@ -197,7 +225,7 @@ impl MarketMemory {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.daily.is_empty()
+        self.daily.is_empty() && self.strategy.is_empty()
     }
 
     /// Compact decision context (memory summary) for the AI prompt.

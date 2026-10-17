@@ -43,11 +43,11 @@ impl RegimeDetector {
         let atr_val  = atr_vals[n - 1].unwrap_or(last * 0.01);
         let atr_pct  = if last > 0.0 { atr_val / last * 100.0 } else { 1.0 };
 
-        // Market-specific volatility threshold
+        // Market-specific intraday volatility threshold (ATR% of price on 1m-15m bars)
         let vol_threshold = match market {
-            Market::Crypto | Market::Forex => 0.8,
-            Market::Gold                   => 1.2,
-            Market::Synthetic              => 1.5,
+            Market::Crypto | Market::Forex => 0.12,
+            Market::Gold                   => 0.25,
+            Market::Synthetic              => 0.50,
         };
 
         // ── EMA spread (trend direction breadth) ───────────────────────────
@@ -75,19 +75,19 @@ impl RegimeDetector {
 
         if atr_pct > vol_threshold * 1.8 {
             regime = Regime::Volatile;
-            reason = format!("ATR% {:.2} far above threshold {:.1}", atr_pct, vol_threshold * 1.8);
+            reason = format!("ATR% {:.3} far above threshold {:.2}", atr_pct, vol_threshold * 1.8);
         } else if is_breakout && adx_val > 18.0 {
             regime = Regime::Breakout;
             reason = format!("Donchian breakout, ADX {:.1}", adx_val);
-        } else if adx_val >= 25.0 && ema_spread_pct >= 0.5 {
+        } else if adx_val >= 22.0 && ema_spread_pct >= 0.02 {
             regime = Regime::Trending;
             let dir = if pdi_val > mdi_val { "bullish" } else { "bearish" };
-            reason = format!("ADX {:.1} trending {}, EMA spread {:.2}%", adx_val, dir, ema_spread_pct);
+            reason = format!("ADX {:.1} trending {}, EMA spread {:.3}%", adx_val, dir, ema_spread_pct);
         } else if adx_val < 20.0 && atr_pct < vol_threshold {
             regime = Regime::Ranging;
-            reason = format!("ADX {:.1} below 20, ATR% {:.2} calm", adx_val, atr_pct);
+            reason = format!("ADX {:.1} below 20, ATR% {:.3} calm", adx_val, atr_pct);
         } else {
-            // Ambiguous zone (ADX 20–25): default to trend-following (safer)
+            // Ambiguous zone (ADX 20–22): default to trend-following
             regime = Regime::Trending;
             reason = format!("ADX {:.1} ambiguous zone → default trending", adx_val);
         }

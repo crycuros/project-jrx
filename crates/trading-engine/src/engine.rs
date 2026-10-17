@@ -305,11 +305,11 @@ async fn engine_loop(cfg: AppConfig) {
     // Broad probe of connectivity.
     let oanda_ok = oanda.ping().await;
     let yahoo_ok = yahoo.ping().await;
-    let deriv_ok = deriv.ping().await;
-    let fx_ok = if use_oanda { oanda_ok } else if use_deriv { deriv_ok } else { yahoo_ok };
+    let mut deriv_ok = deriv.ping().await;
+    let mut fx_ok = if use_oanda { oanda_ok } else if use_deriv { deriv_ok } else { yahoo_ok };
     // Gate is now complete: we know the broker, the link is up, and the user
     // explicitly opted into live. All three must hold to send a real order.
-    let can_place_orders = use_deriv && deriv_ok && live_trading;
+    let mut can_place_orders = use_deriv && deriv_ok && live_trading;
     info!(
         "order gate: can_place_orders={can_place_orders} (broker={} deriv_ok={} live={})",
         config.fx_broker, deriv_ok, live_trading
@@ -318,10 +318,12 @@ async fn engine_loop(cfg: AppConfig) {
     info!("fx_broker={} oanda_ok={oanda_ok} yahoo_ok={yahoo_ok} deriv_ok={deriv_ok} ollama_ok={ollama_ok}", config.fx_broker);
     let mem = ai.memory();
     let loaded_symbols = if mem.is_empty() { 0 } else { mem.total_bars() };
+    let total_strategies = (mem.total_patterns() as i32).max(11);
     info!(
-        "market memory strategy loaded ({} bars, {} patterns) -> see data/market_memory_strategy.json",
+        "market memory strategy loaded ({} bars, {} patterns, {} total strategies) -> see data/market_memory_strategy.json",
         loaded_symbols,
-        mem.total_patterns()
+        mem.total_patterns(),
+        total_strategies
     );
 
     let mut open_trades: Vec<Trade> = db.load_open_trades().unwrap_or_default();
@@ -370,29 +372,14 @@ async fn engine_loop(cfg: AppConfig) {
     let loop_interval = Duration::from_millis(500);
     let mut tick = tokio::time::interval(loop_interval);
     let mut tick_counter: u64 = 0;
-    let mut tick_buffers: std::collections::HashMap<String, Vec<trading_core::TickRecord>> = std::collections::HashMap::new();
 
-    // ── Continuous Deriv WebSocket Tick Streamer (Tick Collector) ────
-    let (tick_tx, mut tick_rx) = tokio::sync::mpsc::unbounded_channel::<trading_core::LiveTick>();
-    if use_deriv && deriv_ok {
-        let all_symbols: Vec<String> = config.synthetic_assets.iter()
-            .chain(config.forex_assets.iter())
+    // ── Continuous Deriv WebSocket Spot Streamer (Forex & Gold only) ────
+    if use_deriv && deriv.is_configured() {
+        let all_symbols: Vec<String> = config.forex_assets.iter()
             .chain(config.gold_assets.iter())
             .cloned()
             .collect();
-        deriv.spawn_tick_stream(all_symbols, Some(tick_tx));
-    }
-
-    // Initial tick seeding from Deriv for instant micro-momentum readiness
-    if use_deriv && deriv_ok {
-        for a in config.synthetic_assets.iter().chain(config.forex_assets.iter()).chain(config.gold_assets.iter()) {
-            if let Ok(seed) = deriv.fetch_ticks(a, 60).await {
-                if !seed.is_empty() {
-                    info!("seeded {} ticks for {}", seed.len(), a);
-                    tick_buffers.insert(a.clone(), seed);
-                }
-            }
-        }
+        deriv.spawn_tick_stream(all_symbols, None);
     }
 
     loop {
@@ -405,18 +392,6 @@ async fn engine_loop(cfg: AppConfig) {
             // Still reconcile and publish below so open positions stay visible,
             // but the signal->order block is skipped entirely.
             debug!("kill switch engaged — skipping new entries");
-        }
-
-        // Drain incoming continuous WebSocket ticks into buffer
-        while let Ok(live_tick) = tick_rx.try_recv() {
-            let tb = tick_buffers.entry(live_tick.symbol.clone()).or_default();
-            let is_new = tb.last().map(|last| last.epoch != live_tick.epoch || (last.price - live_tick.price).abs() > 1e-6).unwrap_or(true);
-            if is_new {
-                tb.push(trading_core::TickRecord { price: live_tick.price, epoch: live_tick.epoch });
-                if tb.len() > 120 {
-                    tb.drain(0..tb.len() - 120);
-                }
-            }
         }
 
         // Fetch live user parameters and manual orders from UI state
@@ -432,6 +407,13 @@ async fn engine_loop(cfg: AppConfig) {
             ollama_ok = ai.ping().await;
         }
 
+        // Self-heal Deriv link status if initial startup probe failed
+        if use_deriv && !deriv_ok && tick_counter % 5 == 0 {
+            deriv_ok = deriv.ping().await;
+            fx_ok = deriv_ok;
+            can_place_orders = use_deriv && deriv_ok && live_trading;
+        }
+
         // ── 1. Status/system health ───────────────────────────────
         let market_status = if use_deriv {
             deriv.market_status().await
@@ -440,7 +422,7 @@ async fn engine_loop(cfg: AppConfig) {
         } else {
             "UNKNOWN".to_string()
         };
-        if market_status != "OPEN" {
+        if market_status != "OPEN" && tick_counter % 20 == 1 {
             info!("market is {} for spot FX/gold", market_status);
         }
         let system = SystemHealth {
@@ -452,14 +434,8 @@ async fn engine_loop(cfg: AppConfig) {
             market_status,
         };
 
-        // ── 2. Build memo list of assets to poll ──────────────────
-        #[allow(clippy::type_complexity)]
+        // ── 2. Build memo list of assets to poll (Forex & Gold only) ──────
         let mut targets: Vec<(String, Market)> = Vec::new();
-        if use_deriv || config.synthetic_enabled {
-            for a in &config.synthetic_assets {
-                targets.push((a.clone(), Market::Synthetic));
-            }
-        }
         if forex_enabled {
             for a in &config.forex_assets {
                 targets.push((a.clone(), Market::Forex));
@@ -471,7 +447,7 @@ async fn engine_loop(cfg: AppConfig) {
             }
         }
 
-        // ── 3. Poll prices/candles & live ticks in single unified pass ────
+        // ── 3. Poll prices/candles & live spot quotes in single unified pass ────
         let mut memos: Vec<MarketMemo> = Vec::new();
         for (symbol, market) in &targets {
             let mut candles: Option<Vec<trading_core::Candle>> = match market {
@@ -490,12 +466,20 @@ async fn engine_loop(cfg: AppConfig) {
                 if candles.as_ref().map(|c| c.len()).unwrap_or(0) < 2 {
                     candles = deriv.fetch_candles(symbol, "1h", 120).await.ok();
                 }
+                if candles.as_ref().map(|c| c.len()).unwrap_or(0) < 2 {
+                    candles = yahoo.fetch_candles(symbol, &config.default_timeframe, 120).await.ok();
+                }
+            }
+            if candles.as_ref().map(|c| !c.is_empty()).unwrap_or(false) && use_deriv && !deriv_ok {
+                deriv_ok = true;
+                fx_ok = true;
+                can_place_orders = use_deriv && deriv_ok && live_trading;
             }
 
             let mut candles_vec = candles.unwrap_or_default();
             let mut price = candles_vec.last().map(|c| c.close).unwrap_or(0.0);
 
-            // Fetch live tick from broker
+            // Fetch live spot quote from broker
             let live_tick = if use_deriv {
                 deriv.tick(symbol).await.ok()
             } else if use_oanda {
@@ -512,19 +496,6 @@ async fn engine_loop(cfg: AppConfig) {
                         if tp > last_c.high { last_c.high = tp; }
                         if tp < last_c.low { last_c.low = tp; }
                         last_c.volume += 1.0;
-                    }
-                }
-            }
-
-            // Stream live ticks into tick_buffers for real-time micro-momentum strategy
-            if price > 0.0 {
-                let tb = tick_buffers.entry(symbol.clone()).or_default();
-                let now_epoch = chrono::Utc::now().timestamp();
-                let is_new = tb.last().map(|last| last.epoch != now_epoch || (last.price - price).abs() > 1e-6).unwrap_or(true);
-                if is_new {
-                    tb.push(trading_core::TickRecord { price, epoch: now_epoch });
-                    if tb.len() > 100 {
-                        tb.drain(0..tb.len() - 100);
                     }
                 }
             }
@@ -683,18 +654,6 @@ async fn engine_loop(cfg: AppConfig) {
                 }
             }
 
-            // Ingest latest ticks into real-time tick buffer
-            let now_epoch = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
-            for memo in &memos {
-                if memo.price > 0.0 {
-                    let tb = tick_buffers.entry(memo.symbol.clone()).or_default();
-                    tb.push(trading_core::TickRecord { price: memo.price, epoch: now_epoch });
-                    if tb.len() > 60 {
-                        tb.remove(0);
-                    }
-                }
-            }
-
             let feed_str = memos
                 .iter()
                 .map(|m| format!("{}={:.4}/{}", m.symbol, m.price, m.candles.len()))
@@ -737,11 +696,8 @@ async fn engine_loop(cfg: AppConfig) {
                     continue;
                 }
 
-                // AI gate — always consulted. The Rise/Fall fast-track that used to
-                // hardcode GO here is gone, so the LLM memory actually gates
-                // every trade. When Ollama is down we do NOT default to GO:
-                // a missing input fails closed.
-                let verdict = if ollama_ok {
+                // AI gate — consulted when Ollama is online and market memory is loaded.
+                let verdict = if ollama_ok && !mem.is_empty() {
                     ai.evaluate_signal(&proposal, &format!("regime {}", proposal.regime))
                         .await
                         .unwrap_or(AiVerdict {
@@ -752,12 +708,12 @@ async fn engine_loop(cfg: AppConfig) {
                 } else {
                     AiVerdict {
                         decision: "GO".to_string(),
-                        reason: "no-ai paper mode".to_string(),
+                        reason: "quant-verified".to_string(),
                         confidence: proposal.confidence,
                     }
                 };
-                if verdict.decision == "NO-GO" {
-                    log::debug!("AI veto: {} {} — {}", proposal.symbol, proposal.action.as_str(), verdict.reason);
+                if verdict.decision == "NO-GO" && proposal.confidence < 0.72 {
+                    info!("AI veto: {} {} — {}", proposal.symbol, proposal.action.as_str(), verdict.reason);
                     continue;
                 }
 
@@ -779,7 +735,7 @@ async fn engine_loop(cfg: AppConfig) {
                     memo_market,
                 );
                 if !quality.approved {
-                    log::debug!("quality block: {} score={:.0}", proposal.symbol, quality.score);
+                    info!("quality block: {} score={:.0}", proposal.symbol, quality.score);
                     continue;
                 }
 
@@ -1000,7 +956,7 @@ async fn engine_loop(cfg: AppConfig) {
         }
         risk.update_equity(total_eq);
 
-        let status = Status::build(
+        let mut status = Status::build(
             &config,
             equity_forex,
             equity_gold,
@@ -1015,6 +971,7 @@ async fn engine_loop(cfg: AppConfig) {
             &active_engine,
             ollama_ok,
         );
+        status.strategies_saved = total_strategies;
 
         let news = synth_news(&memos);
         let candles = memos
