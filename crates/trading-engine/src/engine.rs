@@ -5,10 +5,11 @@ use std::time::Duration;
 use log::{debug, info, warn};
 use tokio::task::JoinHandle;
 
+use trading_ai::agent::{AgentClient, AgentIndicators, AgentRequest, GateVerdict};
 use trading_ai::AiClient;
 use trading_api::AppState;
 use trading_core::{
-    AiVerdict, Candle, Market, NewsItem, OrderSide, Proposal, Status, SystemHealth, Trade,
+    Candle, Market, NewsItem, OrderSide, Proposal, Status, SystemHealth, Trade,
     TradeStatus, UiSnapshot,
 };
 use trading_db::Db;
@@ -17,6 +18,7 @@ use trading_exchange::oanda::OandaClient;
 use trading_exchange::yahoofx::YahooFx;
 use trading_exchange::Exchange;
 use trading_risk::RiskManager;
+use trading_strategy::indicators::{adx, atr, ema, rsi};
 use trading_strategy::StrategyEngine;
 
 use crate::config::AppConfig;
@@ -256,6 +258,56 @@ async fn reconcile_deriv(
     net_deposits
 }
 
+/// The live readings the agent reasons about, measured from the candles the
+/// engine already has in hand.
+fn live_indicators(candles: &[Candle]) -> AgentIndicators {
+    let n = candles.len();
+    if n < 30 {
+        return AgentIndicators::default();
+    }
+    let closes: Vec<f64> = candles.iter().map(|c| c.close).collect();
+    let highs: Vec<f64> = candles.iter().map(|c| c.high).collect();
+    let lows: Vec<f64> = candles.iter().map(|c| c.low).collect();
+    let last = closes[n - 1];
+
+    let ema20 = ema(&closes, 20)[n - 1].unwrap_or(last);
+    let ema50 = ema(&closes, 50)[n - 1].unwrap_or(last);
+    let ema200 = ema(&closes, 200)[n - 1].unwrap_or(last);
+    let atr_v = atr(&highs, &lows, &closes, 14)[n - 1].unwrap_or(last * 0.01);
+    let adx_v = adx(&highs, &lows, &closes, 14).0[n - 1].unwrap_or(0.0);
+    let rsi_v = rsi(&closes, 14)[n - 1].unwrap_or(50.0);
+
+    let trend = if ema20 > ema50 && ema50 > ema200 {
+        "uptrend"
+    } else if ema20 < ema50 && ema50 < ema200 {
+        "downtrend"
+    } else {
+        "mixed"
+    };
+
+    // Where the price sits in the recent range.
+    let window = &candles[n.saturating_sub(50)..];
+    let hi = window.iter().map(|c| c.high).fold(f64::NEG_INFINITY, f64::max);
+    let lo = window.iter().map(|c| c.low).fold(f64::INFINITY, f64::min);
+    let range_pos = if hi > lo {
+        ((last - lo) / (hi - lo) * 100.0).clamp(0.0, 100.0)
+    } else {
+        50.0
+    };
+
+    AgentIndicators {
+        rsi: rsi_v,
+        atr: atr_v,
+        atr_pct: if last > 0.0 { atr_v / last * 100.0 } else { 0.0 },
+        ema20,
+        ema50,
+        ema200,
+        adx: adx_v,
+        trend: trend.to_string(),
+        range_position_pct: range_pos,
+    }
+}
+
 fn fmt_time(epoch_secs: i64) -> String {
     use chrono::{TimeZone, Utc};
     Utc.timestamp_opt(epoch_secs, 0)
@@ -301,6 +353,24 @@ async fn engine_loop(cfg: AppConfig) {
     let strategy = StrategyEngine;
     let mut risk = RiskManager::new(&config);
     let ai = AiClient::new(&config);
+    // The ReAct agent gate. When it is required (the default) and it cannot
+    // be reached, no trade is placed.
+    let agent = AgentClient::new(&config);
+    if agent.is_required() {
+        info!(
+            "the ReAct agent gate is ON: {} (min confidence {:.2})",
+            config.agent_api_url,
+            agent.min_confidence()
+        );
+        match agent.ping().await {
+            Ok(()) => info!("the agent answered — the gate is live"),
+            Err(e) => warn!("the agent did not answer yet: {e} — trades are blocked until it does"),
+        }
+    } else {
+        warn!(
+            "the ReAct agent gate is OFF (AGENT_REQUIRED=false) — trades are taken on the quant signal alone"
+        );
+    }
 
     // Broad probe of connectivity.
     let oanda_ok = oanda.ping().await;
@@ -696,28 +766,9 @@ async fn engine_loop(cfg: AppConfig) {
                     continue;
                 }
 
-                // AI gate — consulted when Ollama is online and market memory is loaded.
-                let verdict = if ollama_ok && !mem.is_empty() {
-                    ai.evaluate_signal(&proposal, &format!("regime {}", proposal.regime))
-                        .await
-                        .unwrap_or(AiVerdict {
-                            decision: "WATCH".to_string(),
-                            reason: "ai unavailable".to_string(),
-                            confidence: 0.3,
-                        })
-                } else {
-                    AiVerdict {
-                        decision: "GO".to_string(),
-                        reason: "quant-verified".to_string(),
-                        confidence: proposal.confidence,
-                    }
-                };
-                if verdict.decision == "NO-GO" && proposal.confidence < 0.72 {
-                    info!("AI veto: {} {} — {}", proposal.symbol, proposal.action.as_str(), verdict.reason);
-                    continue;
-                }
-
-                // Quality gate: multi-candle score against the same symbol's series.
+                // ── The ReAct agent gate ──────────────────────────────────────
+                // The candidate's own candles and market, needed for the live
+                // indicators the agent reasons about.
                 let memo_candles = memos
                     .iter()
                     .find(|m| m.symbol == proposal.symbol)
@@ -728,6 +779,78 @@ async fn engine_loop(cfg: AppConfig) {
                     .find(|m| m.symbol == proposal.symbol)
                     .map(|m| m.market)
                     .unwrap_or(Market::Forex);
+
+                let agent_request = AgentRequest::from_proposal(
+                    &proposal,
+                    &config.default_timeframe,
+                    equity_forex + equity_gold,
+                    (equity_forex + equity_gold).max(10.0),
+                    daily_pnl,
+                    total_pnl,
+                    open_trades.len() as i32,
+                    consecutive_losses,
+                    live_indicators(&memo_candles),
+                );
+                let verdict = agent.evaluate(&agent_request).await;
+
+                let (ai_verdict, ai_reason, agent_stake_cap) = match &verdict {
+                    GateVerdict::Approve {
+                        confidence,
+                        reason,
+                        max_stake_usd,
+                    } => {
+                        info!(
+                            "agent approved: {} {} conf={:.2} — {}",
+                            proposal.symbol,
+                            proposal.action.as_str(),
+                            confidence,
+                            reason
+                        );
+                        (
+                            "GO".to_string(),
+                            reason.clone(),
+                            *max_stake_usd,
+                        )
+                    }
+                    GateVerdict::Reject { reason, confidence } => {
+                        info!(
+                            "agent veto: {} {} conf={:.2} — {}",
+                            proposal.symbol,
+                            proposal.action.as_str(),
+                            confidence,
+                            reason
+                        );
+                        continue;
+                    }
+                    GateVerdict::Unavailable { reason } => {
+                        if agent.is_required() {
+                            // FAIL CLOSED: no verdict means no trade.
+                            warn!(
+                                "agent unavailable, no trade: {} {} — {}",
+                                proposal.symbol,
+                                proposal.action.as_str(),
+                                reason
+                            );
+                        } else {
+                            warn!(
+                                "agent unavailable (AGENT_REQUIRED=false, trading anyway): {} — {}",
+                                proposal.symbol,
+                                reason
+                            );
+                        }
+                        continue;
+                    }
+                    GateVerdict::NotRequired => {
+                        warn!(
+                            "the agent gate is OFF (AGENT_REQUIRED=false) — {} {} trades on the quant signal alone",
+                            proposal.symbol,
+                            proposal.action.as_str()
+                        );
+                        ("GO".to_string(), "agent gate disabled".to_string(), None)
+                    }
+                };
+
+                // Quality gate: multi-candle score against the same symbol's series.
                 let quality = strategy.score_quality(
                     proposal.action,
                     &memo_candles,
@@ -754,6 +877,11 @@ async fn engine_loop(cfg: AppConfig) {
                 } else {
                     decision.suggested_size.clamp(0.05, 50.0)
                 };
+                // The agent may cap the size; never let it raise it.
+                let trade_stake = match agent_stake_cap {
+                    Some(cap) if cap > 0.0 => trade_stake.min(cap),
+                    _ => trade_stake,
+                };
                 let mut trade = Trade {
                     symbol: proposal.symbol.clone(),
                     side: proposal.action,
@@ -765,8 +893,8 @@ async fn engine_loop(cfg: AppConfig) {
                     regime: proposal.regime.clone(),
                     confidence: proposal.confidence,
                     reason: proposal.reason.clone(),
-                    ai_verdict: verdict.decision.clone(),
-                    ai_reason: verdict.reason.clone(),
+                    ai_verdict: ai_verdict.clone(),
+                    ai_reason: ai_reason.clone(),
                     quality_score: (proposal.confidence * 100.0) as f64,
                     market: memos.iter().find(|m| m.symbol == proposal.symbol).map(|m| m.market).unwrap_or(Market::Forex),
                     broker: if use_deriv { "deriv".to_string() } else if use_oanda { "oanda".to_string() } else { "yahoo".to_string() },

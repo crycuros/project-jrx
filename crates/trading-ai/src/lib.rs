@@ -1,5 +1,14 @@
 //! AI evaluation layer — interfaces with local Ollama.
+//!
+//! Two AI paths live here:
+//!
+//! * [`AiClient`] — the original single-shot Ollama gate used by the desktop
+//!   app.
+//! * [`agent::AgentClient`] — the ReAct decision gate: the bot asks the
+//!   Next.js terminal for a verdict before every trade, and the gate fails
+//!   closed.
 
+pub mod agent;
 pub mod history;
 
 use anyhow::{anyhow, Context, Result};

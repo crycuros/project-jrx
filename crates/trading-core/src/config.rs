@@ -25,6 +25,15 @@ pub struct Config {
     pub ollama_base_url: String,
     pub ollama_model: String,
 
+    // ── The ReAct agent gate ───────────────────────────────────────────────
+    // The bot asks this service for a verdict before every trade. The gate
+    // fails CLOSED: if the agent cannot be reached, no trade happens.
+    pub agent_api_url: String,
+    pub agent_timeout_secs: u64,
+    pub agent_min_confidence: f64,
+    pub agent_required: bool,
+    pub agent_api_secret: String,
+
     // Trading
     pub default_asset: String,
     pub trading_mode: String,
@@ -72,6 +81,18 @@ impl Config {
 
             ollama_base_url: dotenv_var("OLLAMA_BASE_URL", "http://localhost:11434"),
             ollama_model: dotenv_var("OLLAMA_MODEL", "llama3.2:3b"),
+
+            // The ReAct agent gate (the Next.js terminal).
+            agent_api_url: dotenv_var("AGENT_API_URL", "http://127.0.0.1:3000"),
+            agent_timeout_secs: dotenv_var("AGENT_TIMEOUT_SECS", "45")
+                .parse()
+                .unwrap_or(45),
+            agent_min_confidence: dotenv_var("AGENT_MIN_CONFIDENCE", "0.6")
+                .parse()
+                .unwrap_or(0.6),
+            // The default is the safe one: without the agent, no trades.
+            agent_required: dotenv_bool("AGENT_REQUIRED", true),
+            agent_api_secret: dotenv_var("AGENT_API_SECRET", ""),
 
             default_asset: dotenv_var("DEFAULT_ASSET", "XAU_USD"),
             trading_mode: dotenv_var("TRADING_MODE", "paper"),
