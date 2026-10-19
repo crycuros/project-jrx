@@ -533,7 +533,7 @@ impl DerivFx {
         if let Some((sl_usd, tp_usd)) = self.limit_amounts(side, entry, sl_price, tp_price, stake) {
             limit = json!({"stop_loss": sl_usd, "take_profit": tp_usd});
         }
-        let prop = json!({
+        let mut prop = json!({
             "proposal": 1,
             "amount": stake,
             "basis": "stake",
@@ -544,7 +544,13 @@ impl DerivFx {
             "limit_order": limit,
             "req_id": 1,
         });
-        let r = self.send_req(prop).await?;
+        let mut r = self.send_req(prop.clone()).await;
+        if r.is_err() && !limit.as_object().map(|o| o.is_empty()).unwrap_or(true) {
+            // Deriv limit_order SL/TP validation can be finicky; fallback to managing SL/TP via engine
+            prop["limit_order"] = json!({});
+            r = self.send_req(prop).await;
+        }
+        let r = r?;
         let pid = r["proposal"]["id"]
             .as_str()
             .ok_or_else(|| anyhow!("deriv: no proposal id: {r}"))?
