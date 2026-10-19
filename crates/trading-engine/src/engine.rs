@@ -353,6 +353,7 @@ async fn engine_loop(cfg: AppConfig) {
     let strategy = StrategyEngine;
     let mut risk = RiskManager::new(&config);
     let ai = AiClient::new(&config);
+    let news_radar = trading_ai::news::NewsRadar::new();
     // The ReAct agent gate. When it is required (the default) and it cannot
     // be reached, no trade is placed.
     let agent = AgentClient::new(&config);
@@ -752,6 +753,12 @@ async fn engine_loop(cfg: AppConfig) {
                 if open_trades.iter().any(|t| t.symbol == proposal.symbol && t.status == TradeStatus::Open) {
                     continue;
                 }
+                // News Shield Guard: Freeze new entries 15m before & 5m after High-Impact News
+                if let Some(freeze_reason) = news_radar.should_freeze_for_news(&proposal.symbol).await {
+                    info!("🚨 NEWS SHIELD ACTIVE (Entry blocked): {} — {}", proposal.symbol, freeze_reason);
+                    continue;
+                }
+                let psychology = news_radar.evaluate_psychology(&proposal.symbol, consecutive_losses).await;
                 let decision = risk.validate(
                     &proposal.symbol,
                     proposal.action,
@@ -881,6 +888,13 @@ async fn engine_loop(cfg: AppConfig) {
                 let trade_stake = match agent_stake_cap {
                     Some(cap) if cap > 0.0 => trade_stake.min(cap),
                     _ => trade_stake,
+                };
+                // Adaptive Trader Psychology: If in Defensive mode, cut stake size in half to protect capital
+                let trade_stake = if psychology == trading_ai::news::TraderPsychology::Defensive {
+                    info!("🛡️ PSYCHOLOGY DEFENSIVE: {} consecutive losses or close news — reducing stake by 50%", consecutive_losses);
+                    (trade_stake * 0.50).max(5.0)
+                } else {
+                    trade_stake
                 };
                 let mut trade = Trade {
                     symbol: proposal.symbol.clone(),
@@ -1101,7 +1115,7 @@ async fn engine_loop(cfg: AppConfig) {
         );
         status.strategies_saved = total_strategies;
 
-        let news = synth_news(&memos);
+        let news = news_radar.get_dashboard_news().await;
         let candles = memos
             .iter()
             .map(|m| (m.symbol.clone(), m.candles.clone()))

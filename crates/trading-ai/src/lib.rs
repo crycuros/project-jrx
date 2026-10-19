@@ -10,6 +10,7 @@
 
 pub mod agent;
 pub mod history;
+pub mod news;
 
 use anyhow::{anyhow, Context, Result};
 use reqwest::Client;
