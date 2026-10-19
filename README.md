@@ -30,6 +30,48 @@ Bloomberg-style dark UI sized for 1440×900.
 - **SQLite persistence** — trades, app-state, and equity snapshots survive
   restarts.
 
+## The ReAct agent gate
+
+Every trade the bot places is put to the ReAct agent first — the Next.js
+terminal in `../ai-react-trader`. The gate **fails closed**:
+
+| the agent says | the bot does |
+|---|---|
+| APPROVE (confidence ≥ `AGENT_MIN_CONFIDENCE`) | trades, with the agent's stake cap |
+| HOLD | does not trade |
+| confidence below the gate | does not trade |
+| unreachable / timed out / unreadable | **does not trade** |
+
+```bash
+# in .env
+AGENT_API_URL=http://127.0.0.1:3000
+AGENT_TIMEOUT_SECS=45
+AGENT_MIN_CONFIDENCE=0.6
+AGENT_REQUIRED=true          # do not set this to false in production
+AGENT_API_SECRET=            # the terminal's API_SECRET, if it has one
+```
+
+The bot sends its own live indicators with the request, so the agent reasons
+about the market as it is rather than about the archive.
+
+Check the wiring at any time:
+
+```bash
+cargo run -p trading-ai --example ask_agent
+```
+
+```
+asking http://127.0.0.1:3000 …
+APPROVE  confidence 0.64
+  reason: The conditioned cell is positive (+0.07R) ...
+  stake cap: $10.00
+```
+
+Stop the terminal and run it again: it reports `UNAVAILABLE`, and the bot
+trades nothing.
+
+---
+
 ## Layout
 
 ```
