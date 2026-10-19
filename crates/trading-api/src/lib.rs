@@ -159,6 +159,7 @@ pub fn api_router(state: AppState) -> Router {
         .route("/api/equity", get(get_equity))
         .route("/api/engine", post(set_engine))
         .route("/api/killswitch", post(set_killswitch))
+        .route("/api/order", post(place_manual_order))
         .route("/apis", get(|| async { "trading-ai-rust api ok" }))
         .route("/ws", get(ws_handler))
         .with_state(state)
@@ -210,6 +211,36 @@ struct KillSwitchReq {
 async fn set_killswitch(State(st): State<AppState>, Json(req): Json<KillSwitchReq>) -> impl IntoResponse {
     st.set_kill_switch(req.enabled);
     (StatusCode::OK, Json(serde_json::json!({"ok": true, "kill_switch": req.enabled})))
+}
+
+#[derive(Deserialize)]
+struct OrderReq {
+    symbol: String,
+    side: String,
+    stake: Option<f64>,
+}
+
+async fn place_manual_order(State(st): State<AppState>, Json(req): Json<OrderReq>) -> impl IntoResponse {
+    let side = if req.side.eq_ignore_ascii_case("sell") {
+        trading_core::OrderSide::Sell
+    } else {
+        trading_core::OrderSide::Buy
+    };
+    let stake = req.stake.unwrap_or(2.0).clamp(1.0, 2000.0);
+    st.queue_order(ManualOrderRequest {
+        symbol: req.symbol.clone(),
+        side,
+        contract_mode: trading_core::ContractMode::Multiplier,
+        stake,
+        duration_ticks: 5,
+    });
+    log::info!("Queued manual order: {} {} stake ${:.2}", side.as_str().to_uppercase(), req.symbol, stake);
+    (StatusCode::OK, Json(serde_json::json!({
+        "ok": true,
+        "symbol": req.symbol,
+        "side": side.as_str(),
+        "stake": stake
+    })))
 }
 
 // ── WebSocket ───────────────────────────────────────────────
