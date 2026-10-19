@@ -749,9 +749,21 @@ async fn engine_loop(cfg: AppConfig) {
                 if open_trades.len() as i32 >= config.max_open_positions {
                     break;
                 }
-                // One position per symbol at a time for Rise/Fall
-                if open_trades.iter().any(|t| t.symbol == proposal.symbol && t.status == TradeStatus::Open) {
+                // Pyramiding stack: up to 3 positions per symbol in strong trending/breakout markets
+                let open_symbol_count = open_trades.iter().filter(|t| t.symbol == proposal.symbol && t.status == TradeStatus::Open).count();
+                if open_symbol_count >= 3 {
                     continue;
+                }
+                if open_symbol_count > 0 {
+                    // Only stack if existing positions for this symbol are already in profit or break-even protected
+                    let protected = open_trades
+                        .iter()
+                        .filter(|t| t.symbol == proposal.symbol && t.status == TradeStatus::Open)
+                        .all(|t| t.unrealized_pnl.unwrap_or(0.0) >= 0.0 || (t.side == OrderSide::Buy && t.stop_loss >= t.entry_price) || (t.side == OrderSide::Sell && t.stop_loss <= t.entry_price));
+                    if !protected {
+                        continue;
+                    }
+                    info!("🚀 PYRAMIDING: Stacking entry #{} for {} in strong {}", open_symbol_count + 1, proposal.symbol, proposal.regime);
                 }
                 // News Shield Guard: Freeze new entries 15m before & 5m after High-Impact News
                 if let Some(freeze_reason) = news_radar.should_freeze_for_news(&proposal.symbol).await {

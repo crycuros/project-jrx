@@ -1,4 +1,4 @@
-﻿//! Risk management: Kelly criterion sizing, correlation penalty, exposure limits, kill switch.
+//! Risk management: Kelly criterion sizing, correlation penalty, exposure limits, kill switch.
 //!
 //! Implements Stage 4 (Constrain) of the 7-stage quant pipeline.
 //!
@@ -101,11 +101,12 @@ impl RiskManager {
             };
         }
 
-        // ── Duplicate symbol guard ───────────────────────────────────────────
-        if open.iter().any(|t| t.symbol == symbol) {
+        // ── Symbol stacking guard (allows up to 3 pyramiding positions per symbol) ─
+        let open_count = open.iter().filter(|t| t.symbol == symbol).count();
+        if open_count >= 3 {
             return RiskDecision {
                 allowed: false,
-                reason: format!("symbol {} already open", symbol),
+                reason: format!("max stacked positions (3) reached for {}", symbol),
                 suggested_size: 0.0,
                 stop_price: 0.0,
             };
