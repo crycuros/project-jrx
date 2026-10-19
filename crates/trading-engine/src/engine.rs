@@ -603,7 +603,7 @@ async fn engine_loop(cfg: AppConfig) {
                 OrderSide::Buy => entry * (1.0 + sl_pct * 2.0),
                 OrderSide::Sell => entry * (1.0 - sl_pct * 2.0),
             };
-            let stake = req.stake.clamp(1.0, 2000.0);
+            let stake = req.stake.clamp(5.0, 2000.0);
 
             if can_place_orders {
                 match deriv
@@ -873,7 +873,7 @@ async fn engine_loop(cfg: AppConfig) {
                 };
                 let dynamic_usd_stake = ((live_eq * active_risk_pct) * 100.0).round() / 100.0;
                 let trade_stake = if use_deriv {
-                    dynamic_usd_stake.clamp(1.0, (live_eq * 0.25).max(1.0))
+                    dynamic_usd_stake.clamp(5.0, (live_eq * 0.25).max(5.0))
                 } else {
                     decision.suggested_size.clamp(0.05, 50.0)
                 };

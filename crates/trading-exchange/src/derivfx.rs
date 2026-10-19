@@ -527,7 +527,7 @@ impl DerivFx {
             OrderSide::Buy => "MULTUP",
             OrderSide::Sell => "MULTDOWN",
         };
-        let stake = clampi(stake, 1.0, 2000.0);
+        let stake = clampi(stake.max(5.0), 5.0, 2000.0);
 
         let mut limit = json!({});
         if let Some((sl_usd, tp_usd)) = self.limit_amounts(side, entry, sl_price, tp_price, stake) {
