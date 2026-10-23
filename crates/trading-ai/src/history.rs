@@ -580,11 +580,15 @@ fn discover_csv(dir: &Path, symbol: &str) -> Option<PathBuf> {
     None
 }
 
-/// market helper used by callers
-pub fn market_of(symbol: &str) -> Market {
-    if symbol == "XAU_USD" || symbol == "XAUUSD" {
-        Market::Gold
-    } else {
-        Market::Forex
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_embedded_strategy_loads() {
+        let cfg = Config::from_env();
+        let mem = MarketMemory::load(&cfg);
+        println!("TOTAL PATTERNS: {}", mem.total_patterns());
+        assert_eq!(mem.total_patterns(), 96);
     }
 }

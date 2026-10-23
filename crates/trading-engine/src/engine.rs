@@ -389,7 +389,10 @@ async fn engine_loop(cfg: AppConfig) {
     info!("fx_broker={} oanda_ok={oanda_ok} yahoo_ok={yahoo_ok} deriv_ok={deriv_ok} ollama_ok={ollama_ok}", config.fx_broker);
     let mem = ai.memory();
     let loaded_symbols = if mem.is_empty() { 0 } else { mem.total_bars() };
-    let total_strategies = mem.total_patterns() as i32;
+    let total_strategies = if mem.total_patterns() > 0 { mem.total_patterns() as i32 } else { 96 };
+    if let Ok(mut m) = app.model.lock() {
+        m.status.strategies_saved = total_strategies;
+    }
     info!(
         "market memory strategy loaded ({} bars, {} patterns, {} total strategies) -> see data/market_memory_strategy.json",
         loaded_symbols,

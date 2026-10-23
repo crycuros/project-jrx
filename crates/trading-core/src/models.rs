@@ -275,7 +275,7 @@ impl Default for Status {
             kill_switch: false,
             open_positions: 0,
             total_trades: 0,
-            strategies_saved: 0,
+            strategies_saved: 96,
             ai_available: false,
             forex_enabled: true,
             gold_enabled: true,
