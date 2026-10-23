@@ -109,6 +109,24 @@ impl MarketMemory {
             }
         }
 
+        // 3) Built-in embedded fallback (all 96 pre-mined strategies bundled directly into the binary)
+        const EMBEDDED_STRAT: &str = include_str!("../../../data/market_memory_strategy.json");
+        if let Ok(strategy) = serde_json::from_str::<HashMap<String, MessageStrategy>>(EMBEDDED_STRAT) {
+            if !strategy.is_empty() {
+                let m = Self {
+                    daily: HashMap::new(),
+                    strategy,
+                };
+                info!(
+                    "market memory: loaded embedded pre-mined strategy ({} symbols / {} bars / {} patterns)",
+                    m.strategy.len(),
+                    m.total_bars(),
+                    m.total_patterns()
+                );
+                return m;
+            }
+        }
+
         let mut m = match Self::build(Path::new(&csv_dir), Path::new(&cache)) {
             Ok(m) => m,
             Err(e) => {
