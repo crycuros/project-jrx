@@ -83,17 +83,40 @@ async fn reconcile_deriv(
             let active_ids: std::collections::HashSet<String> = contracts.iter().map(|c| c.contract_id.to_string()).collect();
 
             // 1. Purge positions from open_trades that are no longer active in Deriv portfolio
+            let mut purged = Vec::new();
             open_trades.retain(|t| {
                 if t.broker == "deriv" {
                     if let Some(ext) = &t.external_id {
                         if !active_ids.contains(ext) {
                             info!("reconcile: contract {ext} ({}) closed on Deriv server, removing from open positions", t.symbol);
+                            purged.push(t.clone());
                             return false;
                         }
                     }
                 }
                 t.status == TradeStatus::Open
             });
+
+            // Automatically move purged contracts to closed_trades so total_trades increments
+            for mut pt in purged {
+                let ext = pt.external_id.clone().unwrap_or_default();
+                if !closed_trades.iter().any(|t| t.external_id.as_deref() == Some(&ext)) {
+                    pt.status = TradeStatus::Closed;
+                    pt.exit_time = Some(now_iso());
+                    if let Ok(cid) = ext.parse::<u64>() {
+                        if let Ok(info) = deriv.contract_info(cid).await {
+                            if info.current_spot > 0.0 {
+                                pt.exit_price = Some(info.current_spot);
+                            }
+                            if info.bid_price > 0.0 {
+                                pt.pnl = Some(info.bid_price - pt.amount);
+                            }
+                        }
+                    }
+                    info!("reconcile: contract {ext} ({}) moved to closed trades (pnl={:?})", pt.symbol, pt.pnl);
+                    closed_trades.push(pt);
+                }
+            }
 
             // 2. Add new active contracts or update existing
             for c in &contracts {
@@ -163,7 +186,7 @@ async fn reconcile_deriv(
         }
         Err(e) => warn!("deriv portfolio sync failed: {e}"),
     }
-    if let Ok(closed) = deriv.profit_table(20).await {
+    if let Ok(closed) = deriv.profit_table(50).await {
         for cc in &closed {
             let ext = cc.contract_id.to_string();
             // Ensure any trade matching this closed contract is purged from open_trades
